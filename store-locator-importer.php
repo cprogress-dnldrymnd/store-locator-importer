@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WPSL Custom XML Importer
  * Description: Imports locations from WP XML export to wpsl_stores with advanced ACF field mapping. Integrates robust Gutenberg JSON parsing for newer locations.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: Digitally Disruptive - Donald Raymundo
  * Author URI: https://digitallydisruptive.co.uk/
  */
@@ -133,8 +133,8 @@ class WPSL_Custom_XML_Importer {
                             $('button[type="submit"]').prop('disabled', false);
                         }
                     },
-                    error: function() {
-                        $log.append('Server error during upload. Please check PHP file limits.\n');
+                    error: function(jqXHR, textStatus, errorThrown) {
+                        $log.append('Server error during upload: ' + textStatus + ' - ' + errorThrown + '\n');
                         $('button[type="submit"]').prop('disabled', false);
                     }
                 });
@@ -164,11 +164,13 @@ class WPSL_Custom_XML_Importer {
                             $('button[type="submit"]').prop('disabled', false);
                         }
                     } else {
+                        // Captures gracefully handled PHP Throwables
                         $log.append('Error during batch execution: ' + response.data.message + '\n');
                         $('button[type="submit"]').prop('disabled', false);
                     }
-                }).fail(function() {
-                    $log.append('Server timeout/error during processing. Retrying batch in 5 seconds...\n');
+                }).fail(function(jqXHR, textStatus, errorThrown) {
+                    // Triggers only on hard 500s or network drops outside the try/catch
+                    $log.append('AJAX network failure: ' + textStatus + ' - ' + errorThrown + '. Retrying batch in 5 seconds...\n');
                     setTimeout(function() {
                         processBatch(offset, batchSize, total, dryRun, importType);
                     }, 5000);
@@ -191,11 +193,12 @@ class WPSL_Custom_XML_Importer {
 
         $file_tmp = $_FILES['xml_file']['tmp_name'];
         
-        ini_set( 'memory_limit', '1024M' );
-        set_time_limit( 300 );
+        ini_set( 'memory_limit', '2048M' );
+        set_time_limit( 0 );
 
         libxml_use_internal_errors( true );
-        $xml = simplexml_load_file( $file_tmp );
+        // Critical: LIBXML_NOCDATA prevents Gutenberg blocks trapped in CDATA from parsing as empty objects
+        $xml = simplexml_load_file( $file_tmp, 'SimpleXMLElement', LIBXML_NOCDATA );
 
         if ( ! $xml ) {
             wp_send_json_error( [ 'message' => 'Invalid or corrupted XML file structure.' ] );
@@ -246,7 +249,15 @@ class WPSL_Custom_XML_Importer {
             'locations'   => $locations
         ];
 
-        file_put_contents( $data_file, wp_json_encode( $export_data ) );
+        $json_payload = wp_json_encode( $export_data );
+        if ( ! $json_payload ) {
+            wp_send_json_error( [ 'message' => 'Failed to serialize JSON payload. Contains malformed characters.' ] );
+        }
+
+        $saved = file_put_contents( $data_file, $json_payload );
+        if ( $saved === false ) {
+            wp_send_json_error( [ 'message' => 'Failed to write map file to server. Verify permissions for the uploads directory.' ] );
+        }
 
         wp_send_json_success( [ 'total' => count( $locations ) ] );
     }
@@ -257,45 +268,69 @@ class WPSL_Custom_XML_Importer {
     public function ajax_process_batch() {
         check_ajax_referer( 'wpsl_import_nonce', 'security' );
 
-        $offset      = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0;
-        $batch       = isset( $_POST['batch'] ) ? (int) $_POST['batch'] : 5;
-        $dry_run     = isset( $_POST['dry_run'] ) && $_POST['dry_run'] === 'true';
-        $import_type = isset( $_POST['import_type'] ) ? sanitize_text_field( $_POST['import_type'] ) : 'new_locations';
-
-        $upload_dir = wp_upload_dir();
-        $data_file  = trailingslashit( $upload_dir['basedir'] ) . 'wpsl_importer/import_data.json';
-
-        if ( ! file_exists( $data_file ) ) {
-            wp_send_json_error( [ 'message' => 'Import data payload decoupled. Please reupload the file.' ] );
-        }
-
-        $data_json   = file_get_contents( $data_file );
-        $data        = json_decode( $data_json, true );
-        $attachments = $data['attachments'];
-        $locations   = $data['locations'];
+        // Force maximum runtime capacity for processing massive multi-dimensional arrays
+        ini_set( 'memory_limit', '2048M' );
+        set_time_limit( 0 );
         
-        $slice = array_slice( $locations, $offset, $batch );
-        
-        if ( empty( $slice ) ) {
-            wp_send_json_success( [ 'log' => "Import trajectory complete.\n", 'done' => true ] );
-        }
+        // Trap output to prevent stray notices from corrupting the JSON response
+        ob_start();
 
-        $log_output = "";
-        foreach ( $slice as $loc ) {
-            $log_output .= $this->process_location( $loc, $attachments, $dry_run, $import_type );
-        }
+        try {
+            $offset      = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0;
+            $batch       = isset( $_POST['batch'] ) ? (int) $_POST['batch'] : 5;
+            $dry_run     = isset( $_POST['dry_run'] ) && $_POST['dry_run'] === 'true';
+            $import_type = isset( $_POST['import_type'] ) ? sanitize_text_field( $_POST['import_type'] ) : 'new_locations';
 
-        wp_send_json_success( [ 'log' => $log_output, 'done' => false ] );
+            $upload_dir = wp_upload_dir();
+            $data_file  = trailingslashit( $upload_dir['basedir'] ) . 'wpsl_importer/import_data.json';
+
+            if ( ! file_exists( $data_file ) ) {
+                throw new \Exception( 'Import data payload decoupled or missing. Please re-upload the file.' );
+            }
+
+            $data_json = file_get_contents( $data_file );
+            $data      = json_decode( $data_json, true );
+            
+            // Null-Safety verification
+            if ( ! is_array( $data ) || ! isset( $data['locations'], $data['attachments'] ) ) {
+                throw new \Exception( 'Failed to decode data map. The JSON structure is corrupted or null.' );
+            }
+
+            $attachments = $data['attachments'];
+            $locations   = $data['locations'];
+            
+            $slice = array_slice( $locations, $offset, $batch );
+            
+            if ( empty( $slice ) ) {
+                ob_end_clean();
+                wp_send_json_success( [ 'log' => "Import trajectory complete.\n", 'done' => true ] );
+            }
+
+            $log_output = "";
+            foreach ( $slice as $loc ) {
+                $log_output .= $this->process_location( $loc, $attachments, $dry_run, $import_type );
+            }
+
+            $stray_output = ob_get_clean();
+            wp_send_json_success( [ 'log' => $log_output, 'done' => false, 'stray_output' => $stray_output ] );
+
+        } catch ( \Throwable $e ) {
+            $stray_output = ob_get_clean();
+            wp_send_json_error( [ 
+                'message' => "Runtime Error: " . $e->getMessage() . " on line " . $e->getLine() . 
+                             ($stray_output ? "\nStray Output: " . $stray_output : "") 
+            ] );
+        }
     }
 
     /**
      * Core Parsing Engine: Maps Target Data and Advanced Gutenberg abstractions to ACF configurations.
      */
     private function process_location( $loc, $attachments, $dry_run, $import_type ) {
-        $slug    = $loc['slug'];
-        $title   = $loc['title'];
-        $content = $loc['content'];
-        $meta    = $loc['meta'];
+        $slug    = (string) $loc['slug'];
+        $title   = (string) $loc['title'];
+        $content = (string) $loc['content'];
+        $meta    = is_array( $loc['meta'] ) ? $loc['meta'] : [];
         
         $log = ">>> Target: {$title} [/{$slug}/]\n";
 
@@ -384,8 +419,8 @@ class WPSL_Custom_XML_Importer {
             
             // 1. CQC Widget Parse
             $cqcBlocks = $this->extractAllAcfBlockJson( $content, 'acf/cqc-widget' );
-            if ( ! empty( $cqcBlocks ) ) {
-                $cqc_id = $cqcBlocks[0]['data']['cqc_id'] ?? $cqc_id;
+            if ( ! empty( $cqcBlocks ) && isset( $cqcBlocks[0]['data']['cqc_id'] ) ) {
+                $cqc_id = $cqcBlocks[0]['data']['cqc_id'];
             }
 
             // 2. Button Parse
@@ -601,7 +636,8 @@ class WPSL_Custom_XML_Importer {
                     if ( $text !== '' ) $parts[] = $text;
                 }
                 
-                if ( $i === 1 && count( $parts ) >= 2 && mb_strlen( $parts[0] ) <= 120 ) {
+                // strlen bypasses strict mbstring dependencies while still allowing logic evaluation
+                if ( $i === 1 && count( $parts ) >= 2 && strlen( $parts[0] ) <= 120 ) {
                     $content = implode( "\n\n", array_slice( $parts, 1 ) );
                 } else {
                     $content = implode( "\n\n", $parts );
@@ -684,7 +720,7 @@ class WPSL_Custom_XML_Importer {
                 $hid = $card['old_attachment_id'];
                 if ( ! $hid || isset( $usedIds[ $hid ] ) ) continue;
                 
-                if ( strpos( mb_strtolower( $card['heading'] ), mb_strtolower( $needle ) ) !== false ) {
+                if ( strpos( strtolower( $card['heading'] ), strtolower( $needle ) ) !== false ) {
                     $usedIds[ $hid ] = true;
                     return (int) $hid;
                 }
