@@ -154,6 +154,9 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		/**
 		 * Extract values from the old `locations` post content.
 		 */
+		/**
+		 * Extract values from the old `locations` post content.
+		 */
 		private static function mapLocationPayload( array $location ): array {
 			$postContent = (string) ( $location['post_content'] ?? '' );
 			$meta = (array) ( $location['meta'] ?? [] );
@@ -186,6 +189,15 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 					$bedrooms = (int) $m[1];
 				}
 			}
+			// FALLBACK: Knollbeck Format
+			if ( $bedrooms === null && isset( $meta['properties_0_property_sidebar_bedrooms'] ) ) {
+				$raw = (string) $meta['properties_0_property_sidebar_bedrooms'];
+				if ( is_numeric( trim( $raw ) ) ) {
+					$bedrooms = (int) trim( $raw );
+				} else if ( preg_match( '/(\d+)/', $raw, $m ) ) {
+					$bedrooms = (int) $m[1];
+				}
+			}
 
 			// CQC id: `acf/cqc-widget`.
 			$cqcId = '';
@@ -195,16 +207,84 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				$data = $first['data'] ?? [];
 				$cqcId = (string) ( $data['cqc_id'] ?? '' );
 			}
+			// FALLBACK: Knollbeck Format
+			if ( ! $cqcId && isset( $meta['properties_0_property_sidebar_cqc_id'] ) ) {
+				$cqcId = (string) $meta['properties_0_property_sidebar_cqc_id'];
+			}
 
 			// Image-column blocks for the first section and the "two columns" section.
 			$twoImageColumns = self::extractImageColumnSections( $postContent );
 
+			// FALLBACK FOR CONTENT: Knollbeck format (Classic ACF Repeater)
+			$oldFormatText = (string) ( $meta['properties_0_property_main_content_property_main_text'] ?? '' );
+			if ( $oldFormatText && empty( $twoImageColumns['first']['content'] ) ) {
+				$text = wp_strip_all_tags( $oldFormatText );
+				$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+				// Split into paragraphs based on double line breaks
+				$paragraphs = preg_split('/\n\s*\n/', $text);
+				$paragraphs = array_values(array_filter(array_map('trim', $paragraphs)));
+
+				if ( count($paragraphs) > 0 ) {
+					$twoImageColumns['first']['content'] = $paragraphs[0];
+					if ( count($paragraphs) > 1 ) {
+						$twoImageColumns['second']['content'] = implode("\n\n", array_slice($paragraphs, 1));
+					}
+				}
+			}
+
+			// FALLBACK FOR CONTENT: Blamsters format (Simple Gutenberg Paragraphs with no ACF blocks)
+			if ( empty( $twoImageColumns['first']['content'] ) && strpos($postContent, '') !== false && strpos($postContent, '\s*<p[^>]*>(.*?)<\/p>\s*/s', $postContent, $matches ) ) {
+					$parts = [];
+					foreach ( $matches[1] as $pHtml ) {
+						$text = wp_strip_all_tags( $pHtml );
+						$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+						$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+						if ( $text !== '' ) {
+							$parts[] = $text;
+						}
+					}
+					if ( count($parts) > 0 ) {
+						$twoImageColumns['first']['content'] = $parts[0];
+						if ( count($parts) > 1 ) {
+							$twoImageColumns['second']['content'] = implode("\n\n", array_slice($parts, 1));
+						}
+					}
+				}
+			}
+
+			// FALLBACK FOR FIRST SECTION HEADING
+			if ( empty( $twoImageColumns['first']['heading'] ) ) {
+				$twoImageColumns['first']['heading'] = (string) ( $location['post_title'] ?? '' );
+			}
+
 			// Expertise/features: `acf/list-icon` blocks.
 			$listIconTitles = self::extractListIconTitles( $postContent );
-			// `our_expertise` has been missing on some stores due to ACF choice key/label mismatch.
-			// Use a stable label-based normalizer to ensure we always write the expected checkbox values.
+
+			// FALLBACK FOR EXPERTISE/FEATURES: Old format mappings
+			if ( ! isset( $listIconTitles['facilities_and_features'] ) ) {
+				$listIconTitles['facilities_and_features'] = [];
+			}
+			if ( ! isset( $listIconTitles['our_expertise'] ) ) {
+				$listIconTitles['our_expertise'] = [];
+			}
+
+			$oldOccupancy = (string) ( $meta['properties_0_property_sidebar_occupancy'] ?? '' );
+			if ( $oldOccupancy && ! in_array( $oldOccupancy, $listIconTitles['facilities_and_features'], true ) ) {
+				$listIconTitles['facilities_and_features'][] = $oldOccupancy;
+			}
+
+			// Scan the old text content to automatically check the right 'Expertise' boxes
+			if ( empty( $listIconTitles['our_expertise'] ) ) {
+				$searchContent = strtolower( $oldFormatText . ' ' . $postContent );
+				if ( strpos( $searchContent, 'autism' ) !== false ) $listIconTitles['our_expertise'][] = 'Autism';
+				if ( strpos( $searchContent, 'learning disabilit' ) !== false ) $listIconTitles['our_expertise'][] = 'Learning Disabilities';
+				if ( strpos( $searchContent, 'mental health' ) !== false ) $listIconTitles['our_expertise'][] = 'Mental Health';
+				if ( strpos( $searchContent, 'complex needs' ) !== false ) $listIconTitles['our_expertise'][] = 'Complex Needs';
+			}
+
 			$ourExpertise = self::normalizeOurExpertiseFromLabels( (array) ( $listIconTitles['our_expertise'] ?? [] ) );
 			$facilitiesAndFeatures = self::normalizeCheckboxValues( 'facilities_and_features', (array) ( $listIconTitles['facilities_and_features'] ?? [] ) );
+			
 			// Keep facilities checkbox aligned with the dedicated bedrooms field.
 			if ( is_int( $bedrooms ) && $bedrooms > 0 && ! in_array( 'Bedrooms', $facilitiesAndFeatures, true ) ) {
 				$facilitiesAndFeatures[] = 'Bedrooms';
@@ -212,12 +292,36 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 
 			// Content cards: `acf/content-cards` blocks -> kitchen/living/dining and gallery slots.
 			$cards = self::extractContentCards( $postContent );
-
 			$orderedGallery = self::buildGalleryFromCards( $cards );
 
+			// FALLBACK FOR OLD FORMAT IMAGES: Map old gallery array directly to the new gallery slots
+			$metaImages = [];
+			if ( isset( $meta['properties_0_property_main_content_images'] ) ) {
+				$unserialized = @unserialize( $meta['properties_0_property_main_content_images'] );
+				if ( is_array( $unserialized ) ) {
+					foreach ( $unserialized as $imgId ) {
+						$metaImages[] = (int) $imgId;
+					}
+				}
+			}
+
+			if ( empty( $orderedGallery['gallery_image_old_attachment_ids'] ) && ! empty( $metaImages ) ) {
+				$orderedGallery['gallery_image_old_attachment_ids'] = $metaImages;
+				$orderedGallery['gallery_texts'] = array_fill(0, count($metaImages), 'Gallery Image');
+			}
+
 			$heroImageOldId = self::extractPageHeaderHeroImageAttachmentId( $postContent );
+			// FALLBACK for Hero Image: Use the standard WordPress featured image if available
+			if ( ! $heroImageOldId ) {
+				$heroImageOldId = (int) ( $meta['_thumbnail_id'] ?? 0 );
+				if ( ! $heroImageOldId ) {
+					$heroImageOldId = null;
+				}
+			}
+
 			$twoColumnsButton = self::extractTwoColumnsButtonFromContent( $postContent );
 			$walkthrough360 = self::extractWalkthrough360FromContent( $postContent );
+			
 			$twoColumnsHeading = (string) ( $twoImageColumns['second']['heading'] ?? '' );
 			if ( trim( $twoColumnsHeading ) === '' ) {
 				$twoColumnsHeading = (string) ( $twoImageColumns['first']['heading'] ?? '' );
@@ -227,17 +331,24 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				$twoColumnsContent = (string) ( $twoImageColumns['first']['content'] ?? '' );
 			}
 
+			$twoColumnsImageId = $twoImageColumns['second']['image_old_attachment_id']
+					?? $twoImageColumns['first']['image_old_attachment_id']
+					?? null;
+
+			// FALLBACK for Two Columns Image
+			if ( ! $twoColumnsImageId && ! empty( $metaImages ) ) {
+				// Pick the first image from the legacy meta array
+				$twoColumnsImageId = $metaImages[0];
+			}
+
 			$oldImageRefs = [
 				'first_section_image' => $heroImageOldId,
-				// Fallback to the first image-column when old content only has one.
-				'two_columns_image' => $twoImageColumns['second']['image_old_attachment_id']
-					?? $twoImageColumns['first']['image_old_attachment_id']
-					?? null,
-				'kitchen' => $orderedGallery['kitchen_old_attachment_id'] ?? null,
-				'living_room' => $orderedGallery['living_room_old_attachment_id'] ?? null,
-				'dining_room' => $orderedGallery['dining_room_old_attachment_id'] ?? null,
-				'gallery_images' => $orderedGallery['gallery_image_old_attachment_ids'] ?? [],
-				'gallery_texts' => $orderedGallery['gallery_texts'] ?? [],
+				'two_columns_image'   => $twoColumnsImageId,
+				'kitchen'             => $orderedGallery['kitchen_old_attachment_id'] ?? null,
+				'living_room'         => $orderedGallery['living_room_old_attachment_id'] ?? null,
+				'dining_room'         => $orderedGallery['dining_room_old_attachment_id'] ?? null,
+				'gallery_images'      => $orderedGallery['gallery_image_old_attachment_ids'] ?? [],
+				'gallery_texts'       => $orderedGallery['gallery_texts'] ?? [],
 			];
 
 			$taxonomyCategory = '';
@@ -254,22 +365,20 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 
 			return [
 				'taxonomy_category_nicename' => $taxonomyCategory,
-				'wpsl' => $wpsl,
-				'bedrooms' => $bedrooms,
-				'cqc_id' => $cqcId,
-				'first_section_heading' => (string) ( $twoImageColumns['first']['heading'] ?? '' ),
-				'first_section_content' => (string) ( $twoImageColumns['first']['content'] ?? '' ),
-				'two_columns_heading' => $twoColumnsHeading,
-				'two_columns_content' => $twoColumnsContent,
-				'our_expertise' => $ourExpertise,
-				'facilities_and_features' => $facilitiesAndFeatures,
-				'two_columns_button_text' => (string) ( $twoColumnsButton['text'] ?? '' ),
-				// Elementor's ACF_URL / href sanitization expects a string URL, not the full Link array.
-				'two_columns_button_link' => (string) ( $twoColumnsButton['link']['url'] ?? '' ),
-				'walkthrough_360' => (string) $walkthrough360,
-				'short_description' => $locationDescription,
-				// Image refs are old attachment IDs; t3 will upload and set ACF fields.
-				'old_image_refs' => $oldImageRefs,
+				'wpsl'                       => $wpsl,
+				'bedrooms'                   => $bedrooms,
+				'cqc_id'                     => $cqcId,
+				'first_section_heading'      => (string) ( $twoImageColumns['first']['heading'] ?? '' ),
+				'first_section_content'      => (string) ( $twoImageColumns['first']['content'] ?? '' ),
+				'two_columns_heading'        => $twoColumnsHeading,
+				'two_columns_content'        => $twoColumnsContent,
+				'our_expertise'              => $ourExpertise,
+				'facilities_and_features'    => $facilitiesAndFeatures,
+				'two_columns_button_text'    => (string) ( $twoColumnsButton['text'] ?? '' ),
+				'two_columns_button_link'    => (string) ( $twoColumnsButton['link']['url'] ?? '' ),
+				'walkthrough_360'            => (string) $walkthrough360,
+				'short_description'          => $locationDescription,
+				'old_image_refs'             => $oldImageRefs,
 			];
 		}
 
