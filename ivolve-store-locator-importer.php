@@ -3,15 +3,13 @@
  * IVolve Store Locator migration helper.
  *
  * Plugin Name: IVolve Store Locator Importer
- * Author: Digitally Disruptive - Donald Raymundo
- * Author URI: https://digitallydisruptive.co.uk/
  * Description: Imports old `locations` CPT content into new `wpsl_stores` Store Locator fields (ACF + images).
- * Version: 0.1.9
+ * Version: 0.1.8
  *
  * Place this file into `wp-content/mu-plugins/` on your staging environment,
  * then run via WP-CLI:
  *
- * wp ivolve locations store-locator-import --old-xml="/path/to/Original Data/ivolve.WordPress.2026-03-23.xml" --slug="68-woodhurst-avenue"
+ *   wp ivolve locations store-locator-import --old-xml="/path/to/Original Data/ivolve.WordPress.2026-03-23.xml" --slug="68-woodhurst-avenue"
  *
  * Notes:
  * - This importer intentionally "fills blanks only" for existing `wpsl_stores` posts by default (`--merge=s2`).
@@ -28,10 +26,6 @@ if ( ! class_exists( 'IVolve_WXR_Store_Locator_Parser' ) ) {
 		// Use untyped property for broader PHP compatibility (avoids PHP 7.4+ typed properties).
 		private $wxrPath;
 
-		/**
-		 * Constructor.
-		 * * @param string $wxrPath Path to the WXR file.
-		 */
 		public function __construct( string $wxrPath ) {
 			$this->wxrPath = $wxrPath;
 		}
@@ -140,11 +134,6 @@ if ( ! class_exists( 'IVolve_WXR_Store_Locator_Parser' ) ) {
 			}
 		}
 
-		/**
-		 * Loads and parses the XML file.
-		 * * @return object SimpleXMLElement object.
-		 * @throws RuntimeException If the file cannot be loaded.
-		 */
 		private function loadXml(): object {
 			$prev = libxml_use_internal_errors( true );
 			$xml = simplexml_load_file( $this->wxrPath );
@@ -164,9 +153,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 	class IVolve_Store_Locator_Import_Command {
 		/**
 		 * Extract values from the old `locations` post content.
-		 * Supports both recent ACF block schemas and older legacy meta structures.
-		 * * @param array $location Parsed WXR item data.
-		 * @return array Store Locator target fields.
 		 */
 		private static function mapLocationPayload( array $location ): array {
 			$postContent = (string) ( $location['post_content'] ?? '' );
@@ -201,7 +187,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				}
 			}
 
-			// CQC id: `acf/cqc-widget` or legacy meta fallback.
+			// CQC id: `acf/cqc-widget`.
 			$cqcId = '';
 			$cqcBlocks = self::extractAllAcfBlockJson( $postContent, 'acf/cqc-widget' );
 			if ( ! empty( $cqcBlocks ) ) {
@@ -209,59 +195,9 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				$data = $first['data'] ?? [];
 				$cqcId = (string) ( $data['cqc_id'] ?? '' );
 			}
-			if ( empty( $cqcId ) && ! empty( $meta['properties_0_property_sidebar_cqc_id'] ) ) {
-				$cqcId = (string) $meta['properties_0_property_sidebar_cqc_id'];
-			}
 
 			// Image-column blocks for the first section and the "two columns" section.
 			$twoImageColumns = self::extractImageColumnSections( $postContent );
-
-			// Content cards: `acf/content-cards` blocks -> kitchen/living/dining and gallery slots.
-			$cards = self::extractContentCards( $postContent );
-
-			$orderedGallery = self::buildGalleryFromCards( $cards );
-			$heroImageOldId = self::extractPageHeaderHeroImageAttachmentId( $postContent );
-
-			// Fallback: Populate missing images from legacy thumbnail or properties gallery meta.
-			if ( ! $heroImageOldId && ! empty( $meta['_thumbnail_id'] ) ) {
-				$heroImageOldId = (int) $meta['_thumbnail_id'];
-			}
-			$legacyImages = ! empty( $meta['properties_0_property_main_content_images'] ) 
-				? maybe_unserialize( $meta['properties_0_property_main_content_images'] ) : [];
-			
-			if ( ! $heroImageOldId && is_array( $legacyImages ) && ! empty( $legacyImages ) ) {
-				$heroImageOldId = (int) reset( $legacyImages );
-			}
-			if ( empty( $orderedGallery['gallery_image_old_attachment_ids'] ) && is_array( $legacyImages ) && ! empty( $legacyImages ) ) {
-				$orderedGallery['gallery_image_old_attachment_ids'] = array_map( 'intval', array_values( $legacyImages ) );
-			}
-
-			// Fallback: Legacy formats utilizing plain Gutenberg or properties meta.
-			if ( trim( $twoImageColumns['first']['content'] ?? '' ) === '' ) {
-				$legacyText = '';
-				if ( ! empty( $meta['properties_0_property_main_content_property_main_text'] ) ) {
-					$legacyText = wp_strip_all_tags( (string) $meta['properties_0_property_main_content_property_main_text'] );
-				} else if ( trim( $postContent ) !== '' ) {
-					if ( preg_match_all( '/\s*<p[^>]*>(.*?)<\/p>\s*/s', $postContent, $matches ) ) {
-						$parts = [];
-						foreach ( $matches[1] as $pHtml ) {
-							$text = wp_strip_all_tags( $pHtml );
-							$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-							$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
-							if ( $text !== '' ) {
-								$parts[] = $text;
-							}
-						}
-						$legacyText = implode( "\n\n", $parts );
-					} else {
-						$legacyText = trim( wp_strip_all_tags( $postContent ) );
-					}
-				}
-
-				if ( $legacyText !== '' ) {
-					$twoImageColumns['first']['content'] = trim( $legacyText );
-				}
-			}
 
 			// Expertise/features: `acf/list-icon` blocks.
 			$listIconTitles = self::extractListIconTitles( $postContent );
@@ -274,6 +210,12 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				$facilitiesAndFeatures[] = 'Bedrooms';
 			}
 
+			// Content cards: `acf/content-cards` blocks -> kitchen/living/dining and gallery slots.
+			$cards = self::extractContentCards( $postContent );
+
+			$orderedGallery = self::buildGalleryFromCards( $cards );
+
+			$heroImageOldId = self::extractPageHeaderHeroImageAttachmentId( $postContent );
 			$twoColumnsButton = self::extractTwoColumnsButtonFromContent( $postContent );
 			$walkthrough360 = self::extractWalkthrough360FromContent( $postContent );
 			$twoColumnsHeading = (string) ( $twoImageColumns['second']['heading'] ?? '' );
@@ -332,15 +274,256 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		}
 
 		/**
-		 * Extract ACF JSON data objects from blocks.
+		 * Extract ACF JSON data objects from blocks like:
+		 *   <!-- wp:acf/cqc-widget {"name":"acf/cqc-widget","data":{...}} /-->
 		 *
-		 * @param string $postContent Content string.
-		 * @param string $blockSlug Block identifier.
 		 * @return array<int, array> list of decoded JSON objects
 		 */
 		private static function extractAllAcfBlockJson( string $postContent, string $blockSlug ): array {
 			$out = [];
-			$needle = '';
+			$needle = '<!-- wp:' . $blockSlug;
+			$offset = 0;
+			while ( true ) {
+				$pos = strpos( $postContent, $needle, $offset );
+				if ( $pos === false ) {
+					break;
+				}
+
+				$braceStart = strpos( $postContent, '{', $pos );
+				if ( $braceStart === false ) {
+					break;
+				}
+
+				$braceEnd = self::findMatchingBrace( $postContent, $braceStart );
+				if ( $braceEnd === -1 ) {
+					break;
+				}
+
+				$jsonStr = substr( $postContent, $braceStart, $braceEnd - $braceStart + 1 );
+				$decoded = json_decode( $jsonStr, true );
+				if ( is_array( $decoded ) ) {
+					$out[] = $decoded;
+				}
+
+				$offset = $braceEnd + 1;
+			}
+			return $out;
+		}
+
+		/**
+		 * Normalize "Our Expertise" checkbox items using visible labels.
+		 *
+		 * For "Mental Health" we intentionally include both "Mental Health" and
+		 * "Mental Health Needs" when the old XML provides "Mental Health Needs".
+		 * This increases the odds that we match the ACF checkbox choice value,
+		 * since the exact stored choice value seems inconsistent between stores.
+		 *
+		 * @param array<int, string> $items
+		 * @return array<int, string>
+		 */
+		private static function normalizeOurExpertiseFromLabels( array $items ): array {
+			$order = [ 'Autism', 'Learning Disabilities', 'Mental Health', 'Mental Health Needs', 'Complex Needs' ];
+			$out = [];
+
+			$seen = [];
+			// "Mental Health Needs" sometimes needs to be preserved as-is for ACF choice-value matching.
+			$map = [
+				'autism' => [ 'Autism' ],
+				'learning disabilities' => [ 'Learning Disabilities' ],
+				'mental health' => [ 'Mental Health' ],
+				'mental health needs' => [ 'Mental Health', 'Mental Health Needs' ],
+				'complex needs' => [ 'Complex Needs' ],
+			];
+			foreach ( $items as $raw ) {
+				$v = trim( html_entity_decode( (string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+				if ( $v === '' ) {
+					continue;
+				}
+				$key = strtolower( preg_replace( '/\s+/u', ' ', $v ) );
+				if ( isset( $map[ $key ] ) ) {
+					foreach ( $map[ $key ] as $canon ) {
+						$seen[ (string) $canon ] = true;
+					}
+				}
+			}
+
+			foreach ( $order as $opt ) {
+				if ( isset( $seen[ $opt ] ) ) {
+					$out[] = $opt;
+				}
+			}
+
+			return $out;
+		}
+
+		private static function extractPageHeaderHeroImageAttachmentId( string $postContent ): ?int {
+			$blocks = self::extractAllAcfBlockJson( $postContent, 'acf/page-header' );
+			if ( empty( $blocks ) ) {
+				return null;
+			}
+			$data = $blocks[0]['data'] ?? [];
+			if ( ! is_array( $data ) ) {
+				return null;
+			}
+			$img = $data['image'] ?? null;
+			$img = is_numeric( $img ) ? (int) $img : null;
+			return $img && $img > 0 ? $img : null;
+		}
+
+		/**
+		 * Extract the "View Service Profile" PDF button (acf/button block) from old content.
+		 *
+		 * @return array<string, mixed>|null { 'text' => string, 'link' => array{url:string,title:string,target:string} }
+		 */
+		private static function extractTwoColumnsButtonFromContent( string $postContent ): ?array {
+			$buttons = self::extractAllAcfBlockJson( $postContent, 'acf/button' );
+			if ( empty( $buttons ) ) {
+				return null;
+			}
+
+			$pdfButtons = [];
+			foreach ( $buttons as $block ) {
+				$data = $block['data'] ?? [];
+				if ( ! is_array( $data ) ) {
+					continue;
+				}
+				$link = $data['button_link'] ?? [];
+				if ( ! is_array( $link ) ) {
+					continue;
+				}
+				$url = (string) ( $link['url'] ?? '' );
+				$title = (string) ( $link['title'] ?? '' );
+				$target = (string) ( $link['target'] ?? '' );
+
+				if ( ! $url ) {
+					continue;
+				}
+
+				// Prefer a PDF, because that's what the new field expects.
+				$lower = strtolower( $url );
+				if ( substr( $lower, -4 ) === '.pdf' ) {
+					$pdfButtons[] = [
+						'text' => $title,
+						'link' => [
+							'url' => $url,
+							'title' => $title,
+							'target' => $target,
+						],
+					];
+				}
+			}
+
+			if ( ! empty( $pdfButtons ) ) {
+				// Choose the last PDF button found (most specific/most recent in content).
+				return $pdfButtons[ count( $pdfButtons ) - 1 ];
+			}
+
+			// Fallback: last button with a URL.
+			for ( $i = count( $buttons ) - 1; $i >= 0; $i -- ) {
+				$data = $buttons[ $i ]['data'] ?? [];
+				if ( ! is_array( $data ) ) continue;
+				$link = $data['button_link'] ?? [];
+				if ( ! is_array( $link ) ) continue;
+				$url = (string) ( $link['url'] ?? '' );
+				if ( ! $url ) continue;
+				$title = (string) ( $link['title'] ?? '' );
+				$target = (string) ( $link['target'] ?? '' );
+
+				return [
+					'text' => $title,
+					'link' => [
+						'url' => $url,
+						'title' => $title,
+						'target' => $target,
+					],
+				];
+			}
+
+			return null;
+		}
+
+		private static function extractWalkthrough360FromContent( string $postContent ): string {
+			// Look for a YouTube embed iframe and reuse it as-is.
+			// If not found, return empty so merge_strategy=s2 will preserve existing values.
+			$pattern = '/(<iframe[^>]+src="https?:\/\/www\.youtube\.com\/embed\/[^"]+"[^>]*><\/iframe>)/i';
+			if ( preg_match( $pattern, $postContent, $m ) ) {
+				return (string) $m[1];
+			}
+
+			return '';
+		}
+
+		private static function findMatchingBrace( string $s, int $startIndex ): int {
+			$depth = 0;
+			$inString = false;
+			$escape = false;
+
+			$len = strlen( $s );
+			for ( $i = $startIndex; $i < $len; $i++ ) {
+				$ch = $s[ $i ];
+
+				if ( $inString ) {
+					if ( $escape ) {
+						$escape = false;
+						continue;
+					}
+					if ( $ch === '\\' ) {
+						$escape = true;
+						continue;
+					}
+					if ( $ch === '"' ) {
+						$inString = false;
+					}
+					continue;
+				}
+
+				if ( $ch === '"' ) {
+					$inString = true;
+					continue;
+				}
+
+				if ( $ch === '{' ) {
+					$depth ++;
+				} else if ( $ch === '}' ) {
+					$depth --;
+					if ( $depth === 0 ) {
+						return $i;
+					}
+				}
+			}
+
+			return -1;
+		}
+
+		/**
+		 * Extract the first two `acf/image-column` blocks: first section and the "two columns" section.
+		 *
+		 * @return array{
+		 *   first: array{heading:string, content:string, image_old_attachment_id:?int},
+		 *   second: array{heading:string, content:string, image_old_attachment_id:?int}
+		 * }
+		 */
+		private static function extractImageColumnSections( string $postContent ): array {
+			$jsonBlocks = self::extractAllAcfBlockJson( $postContent, 'acf/image-column' );
+
+			$out = [
+				'first' => [
+					'heading' => '',
+					'content' => '',
+					'image_old_attachment_id' => null,
+				],
+				'second' => [
+					'heading' => '',
+					'content' => '',
+					'image_old_attachment_id' => null,
+				],
+			];
+
+			// Slice each image-column block content so we can pull its own heading + paragraphs.
+			$segments = [];
+			$offset = 0;
+			$openTag = '<!-- wp:acf/image-column';
+			$closeTag = '<!-- /wp:acf/image-column -->';
 			while ( true ) {
 				$start = strpos( $postContent, $openTag, $offset );
 				if ( $start === false ) {
@@ -358,7 +541,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			}
 
 			$extractHeading = function ( string $segment ): string {
-				if ( preg_match( '/\s*<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m ) ) {
+				if ( preg_match( '/<!-- wp:heading.*?-->\s*<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m ) ) {
 					return trim( html_entity_decode( wp_strip_all_tags( $m[1] ) ) );
 				}
 				// Fallback: first h2 in segment.
@@ -370,7 +553,11 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 
 			$extractParagraphs = function ( string $segment, bool $truncateAtFirstButton = true ): array {
 				if ( $truncateAtFirstButton ) {
-					$buttonPos = strpos( $segment, '\s*<p[^>]*>(.*?)<\/p>\s*/s', $beforeButton, $matches ) ) {
+					$buttonPos = strpos( $segment, '<!-- wp:acf/button' );
+					$beforeButton = $buttonPos === false ? $segment : substr( $segment, 0, $buttonPos );
+
+					// Only take paragraphs before the first CTA button for the first section.
+					if ( ! preg_match_all( '/<!-- wp:paragraph.*?-->\s*<p[^>]*>(.*?)<\/p>\s*<!-- \/wp:paragraph -->/s', $beforeButton, $matches ) ) {
 						return [];
 					}
 
@@ -387,7 +574,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				}
 
 				// For the second section we must not truncate at buttons, and we also
-				// can't rely on Gutenberg `` comments being present.
+				// can't rely on Gutenberg `<!-- wp:paragraph -->` comments being present.
 				$parts = [];
 				if ( preg_match_all( '/<p[^>]*>(.*?)<\/p>/s', $segment, $matches ) ) {
 					foreach ( $matches[1] as $pHtml ) {
@@ -519,11 +706,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return $out;
 		}
 
-		/**
-		 * Extracts expertise titles recursively.
-		 * * @param string $postContent String content body.
-		 * @return array Extracted feature titles.
-		 */
 		private static function extractListIconTitles( string $postContent ): array {
 			$out = [
 				'our_expertise' => [],
@@ -577,8 +759,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		/**
 		 * Normalize list-icon titles so they match ACF checkbox choices exactly.
 		 *
-		 * @param string $fieldName ACF attribute.
-		 * @param array<int, string> $items Extracted arrays.
+		 * @param array<int, string> $items
 		 * @return array<int, string>
 		 */
 		private static function normalizeCheckboxValues( string $fieldName, array $items ): array {
@@ -674,7 +855,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		/**
 		 * Build mapping of both checkbox labels and choice keys to the stored checkbox value.
 		 *
-		 * @param string $fieldName Subject name.
 		 * @return array<string, mixed> map of normalized string -> stored value
 		 */
 		private static function buildCheckboxChoiceValueMap( string $fieldName ): array {
@@ -705,8 +885,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		}
 
 		/**
-		 * Get values allowed for choices based on ACF configuration.
-		 * * @param string $fieldName Reference key.
 		 * @return array<int, string>
 		 */
 		private static function getCheckboxAllowedValues( string $fieldName ): array {
@@ -731,8 +909,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		}
 
 		/**
-		 * Extracts `acf/content-cards` details array.
-		 * * @param string $postContent Encoded block.
 		 * @return array<int, array{heading:string, old_attachment_id:int|null}>
 		 */
 		private static function extractContentCards( string $postContent ): array {
@@ -877,11 +1053,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			];
 		}
 
-		/**
-		 * Fetch corresponding native Store ID based on specific permalink slug.
-		 * * @param string $slug Valid location slug identifier.
-		 * @return int Target WP ID.
-		 */
 		private static function getExistingStoreIdBySlug( string $slug ): int {
 			$posts = get_posts(
 				[
@@ -895,11 +1066,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return ! empty( $posts ) ? (int) $posts[0] : 0;
 		}
 
-		/**
-		 * Determines destination title slug based off of XML parsed post variables.
-		 * * @param array $location Post context.
-		 * @return string Valid slug.
-		 */
 		private static function getImportSlug( array $location ): string {
 			$postName = trim( (string) ( $location['post_name'] ?? '' ) );
 			if ( $postName !== '' ) {
@@ -920,11 +1086,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return 'legacy-location-' . wp_generate_password( 8, false, false );
 		}
 
-		/**
-		 * Transcribes legacy post statuses into valid target flags.
-		 * * @param array $location WP post object definition.
-		 * @return string Mapped target status.
-		 */
 		private static function mapOldStatusToTargetStatus( array $location ): string {
 			$old = strtolower( trim( (string) ( $location['post_status'] ?? '' ) ) );
 			if ( $old === 'draft' ) {
@@ -933,14 +1094,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return 'publish';
 		}
 
-		/**
-		 * Safely delegates standard field insertion alongside defined override handling parameters.
-		 * * @param int $storeId Valid active post container.
-		 * @param string $fieldName Metadata string accessor.
-		 * @param mixed $value Insertion value representation.
-		 * @param bool $isExisting Signals duplicate status limits.
-		 * @param string $merge Processing constraint flag.
-		 */
 		private static function updateFieldIfNeeded( int $storeId, string $fieldName, $value, bool $isExisting, string $merge ): void {
 			// For new stores: always set.
 			if ( ! $isExisting ) {
@@ -960,14 +1113,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			}
 		}
 
-		/**
-		 * Pre-evaluates field applicability based upon configured write boundaries.
-		 * * @param int $storeId Subject container context.
-		 * @param string $fieldName Metadata map reference.
-		 * @param bool $isExisting Whether item is a fresh save vs rewrite.
-		 * @param string $merge Processing rule reference.
-		 * @return bool Validity result indicator.
-		 */
 		private static function shouldUpdateField( int $storeId, string $fieldName, bool $isExisting, string $merge ): bool {
 			if ( ! $isExisting ) {
 				return true;
@@ -1065,12 +1210,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return $isEmpty;
 		}
 
-		/**
-		 * Direct invocation implementation logic ensuring dual compatibility against native API or standalone WP routines.
-		 * * @param int $storeId Insertion entity id.
-		 * @param string $fieldName Field identification label.
-		 * @param mixed $value Insertion value object payload.
-		 */
 		private static function doUpdateField( int $storeId, string $fieldName, $value ): void {
 			if ( function_exists( 'update_field' ) ) {
 				update_field( $fieldName, $value, $storeId );
@@ -1091,15 +1230,9 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		}
 
 		/**
-		 * Initiates image download, cache checks, error boundaries, and attachment saving procedures.
-		 *
-		 * @param int|string|null $oldAttachmentRef old attachment id (int) OR old attachment URL (string)
 		 * @param array<int, string> $attachmentUrlMap old attachment id => url
 		 * @param array<string, int> $uploadedCache cache old id/url => new attachment id
-		 * @param int $storeId Linked association wrapper.
-		 * @param bool $dryRun Verification flag.
-		 * @param array &$report Statistics container tracking mapping and sideload outputs.
-		 * @return int|null Created target file identifier.
+		 * @param int|string|null $oldAttachmentRef old attachment id (int) OR old attachment URL (string)
 		 */
 		private static function sideloadOldAttachmentId( $oldAttachmentRef, array $attachmentUrlMap, array &$uploadedCache, int $storeId, bool $dryRun, array &$report ): ?int {
 			if ( empty( $oldAttachmentRef ) ) {
@@ -1163,14 +1296,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			return (int) $newId;
 		}
 
-		/**
-		 * Direct utility executing fallback update handlers matching meta values against specific overwrite schemas.
-		 * * @param int $storeId Association tracking.
-		 * @param string $metaKey Column specifier.
-		 * @param mixed $value Direct primitive parameter mapping payload entry.
-		 * @param bool $isExisting Entity persistence verification status string matching flag validation check logic structure.
-		 * @param string $merge Configuration policy handling constraints structure schema.
-		 */
 		private static function updatePostMetaIfNeeded( int $storeId, string $metaKey, $value, bool $isExisting, string $merge ): void {
 			if ( ! $isExisting ) {
 				update_post_meta( $storeId, $metaKey, $value );
@@ -1189,11 +1314,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			}
 		}
 
-		/**
-		 * Inserts mapped valid categories associated directly alongside location context references safely avoiding duplicates.
-		 * * @param int $storeId System container ID reference entity tracking parameter input.
-		 * @param string $nicename System internal validation category term configuration logic string matching representation parameter schema validation array.
-		 */
 		private static function ensureWpslCategory( int $storeId, string $nicename ): void {
 			if ( ! $nicename ) {
 				return;
@@ -1212,10 +1332,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		/**
 		 * Import core logic that can be triggered from the WP admin dashboard.
 		 *
-		 * @param string $oldXml Uploaded file reference string link.
-		 * @param string $slug Restricting identifier constraints validation parameter filter schema variable.
-		 * @param string $merge Config parameter limiting replacement parameters schema array configuration object parsing constraint target flag tracking values schema execution environment context string.
-		 * @param bool $dryRun Target execution constraint schema parameter toggle object reference.
 		 * @return array<string,mixed> report counters
 		 */
 		public static function importFromOldXml( string $oldXml, string $slug, string $merge, bool $dryRun ): array {
@@ -1307,7 +1423,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 										return '';
 									}
 									$descEsc = esc_html( $desc );
-									return '' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '';
+									return '<!-- wp:paragraph -->' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '<!-- /wp:paragraph -->';
 								} )(),
 							],
 							true
@@ -1448,7 +1564,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 					// Store Locator template may render the short description from it.
 					$desc = (string) ( $payload['short_description'] ?? '' );
 					if ( $desc ) {
-						$desiredContent = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
+						$desiredContent = '<!-- wp:paragraph -->' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '<!-- /wp:paragraph -->';
 						if ( ! $isExisting ) {
 							wp_update_post(
 								[
@@ -1479,12 +1595,15 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 		}
 
 		/**
-		 * WP-CLI command handler implementation.
-		 * * Required arguments: `--old-xml=/path/to/file`
-		 * Optional arguments: `--slug`, `--merge`, `--dry-run`
+		 * WP-CLI command: `wp ivolve locations store-locator-import ...`
 		 *
-		 * @param array $args Unassoc parameters mapped out structurally via WP_CLI configuration parameter array configuration inputs context schema values payload context.
-		 * @param array $assoc_args Configured flag parameter string execution context input wrapper string format structure input.
+		 * Required:
+		 * - --old-xml=/path/to/original-export.xml
+ *
+		 * Optional:
+		 * - --slug=68-woodhurst-avenue (limit)
+		 * - --merge=s2 (fill blanks only) [default]
+		 * - --dry-run=1
 		 */
 		public static function run( array $args, array $assoc_args ): void {
 			$oldXml = (string) ( $assoc_args['old-xml'] ?? '' );
@@ -1547,7 +1666,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 										return '';
 									}
 									$descEsc = esc_html( $desc );
-									return '' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '';
+									return '<!-- wp:paragraph -->' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '<!-- /wp:paragraph -->';
 								} )(),
 							],
 							true
@@ -1682,7 +1801,7 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 						// because the Store Locator template may render this field directly.
 						$desc = (string) ( $payload['short_description'] ?? '' );
 						if ( $desc ) {
-							$desiredContent = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
+							$desiredContent = '<!-- wp:paragraph -->' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '<!-- /wp:paragraph -->';
 							if ( ! $isExisting || $merge !== 's2' ) {
 								// For newly created records, it's already set on insert; for non-s2, refresh it.
 								wp_update_post(
@@ -1858,3 +1977,4 @@ if ( is_admin() ) {
 		}
 	);
 }
+
