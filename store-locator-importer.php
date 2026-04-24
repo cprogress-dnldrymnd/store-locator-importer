@@ -54,13 +54,13 @@ class WPSL_Custom_XML_Importer {
     }
 
     /**
-     * Renders the UI for the XML Importer in the WordPress admin area.
+     * Renders the UI for the XML Importer in the WordPress admin area, injecting the structural scope selector.
      */
     public function render_admin_page() {
         ?>
         <div class="wrap">
             <h1>WP Store Locator - Custom XML Importer</h1>
-            <p>Upload the XML export file and define the target architecture for parsing `post_content` logic.</p>
+            <p>Upload the XML export file and define the target architecture for parsing <code>post_content</code> logic and ACF meta injections.</p>
             
             <form id="wpsl-import-form" method="post" enctype="multipart/form-data" style="background:#fff; padding:20px; border:1px solid #ccd0d4; box-shadow:0 1px 1px rgba(0,0,0,.04); max-width:800px; margin-top:20px;">
                 <table class="form-table">
@@ -291,6 +291,7 @@ class WPSL_Custom_XML_Importer {
 
     /**
      * Core Parsing Engine: Executes block abstractions and maps target data to WP Store Locator and ACF fields.
+     * Selectively bypasses complex Location Setting assignments based on the defined execution architecture.
      *
      * @param array  $loc The location parameters.
      * @param array  $attachments The universal attachments map linking old IDs to source URIs.
@@ -306,22 +307,10 @@ class WPSL_Custom_XML_Importer {
         
         $log = ">>> Target: {$title} [/{$slug}/]\n";
 
-        // Logic Override: Determine if the target expects older layout architecture 
-        // Overwrite $content with values synthesized sequentially from the ACF properties repeater
+        // Route assignment: Extract direct meta property string instead of using WP Content payload for legacy nodes
         if ( $import_type === 'old_locations' ) {
-            $property_names = [];
-            foreach ( $meta as $key => $val ) {
-                if ( preg_match( '/^properties_(\d+)_property_name$/', $key, $m ) ) {
-                    $property_names[ (int) $m[1] ] = $val;
-                }
-            }
-            if ( ! empty( $property_names ) ) {
-                ksort( $property_names ); // Reorder strictly by numeric repeater index
-                $content = implode( "\n\n", $property_names );
-                $log .= "    [Info] Pre-compiling post_content synthesized from ACF 'properties' repeater.\n";
-            } else {
-                $log .= "    [Warning] Old Location configuration selected, but no 'properties_X_property_name' meta found.\n";
-            }
+            $content = isset( $meta['properties_0_property_main_content_property_main_text'] ) ? $meta['properties_0_property_main_content_property_main_text'] : '';
+            $log .= "    [Info] Targeting legacy architecture. Pre-compiling post_content from specific meta properties.\n";
         }
 
         // Query against WP scope to preserve unique slug structures instead of recreating
@@ -373,13 +362,7 @@ class WPSL_Custom_XML_Importer {
         $two_columns_btn_text = '';
         $two_columns_btn_link = '';
 
-        // 1. Parse Existing Serialized Metadata Layouts 
-        if ( ! empty( $meta['Bedrooms'] ) ) {
-            $bedrooms = $meta['Bedrooms'];
-        } elseif ( ! empty( $meta['properties_0_property_sidebar_bedrooms'] ) ) {
-            $bedrooms = $meta['properties_0_property_sidebar_bedrooms'];
-        }
-        
+        // 1. Process Extant Serialized Metadata Layers First (Universal for Gallery Images and CQC ID)
         if ( ! empty( $meta['properties_0_property_sidebar_cqc_id'] ) ) {
             $cqc_id = $meta['properties_0_property_sidebar_cqc_id'];
         }
@@ -400,7 +383,7 @@ class WPSL_Custom_XML_Importer {
             }
         }
 
-        // 2. Parse inner Gutenberg JSON architectures for newer locations
+        // 2. Parse inner Gutenberg JSON architectures strictly for modern formatting executions
         if ( $import_type === 'new_locations' ) {
             
             // Extract Block JSON Configurations mapped under the wp:acf wrapper
@@ -437,7 +420,7 @@ class WPSL_Custom_XML_Importer {
                                 }
                             }
 
-                            // CQC Widget Parse
+                            // CQC Widget Parse from Modern Blocks
                             if ( $k === 'cqc_id' ) {
                                 $cqc_id = $v;
                             }
@@ -463,7 +446,7 @@ class WPSL_Custom_XML_Importer {
                     $two_cols_heading = wp_strip_all_tags( $h2_match[1] );
                 }
                 
-                // Clear the header strings and core WP annotations to yield explicit <p> paragraph content
+                // Clear the header strings and core WP annotations to yield explicit paragraph content
                 $clean_content = preg_replace( '//s', '', $col_html );
                 $clean_content = preg_replace( '/<h2[^>]*>.*?<\/h2>/is', '', $clean_content );
                 $two_cols_content = trim( $clean_content );
@@ -472,11 +455,8 @@ class WPSL_Custom_XML_Importer {
 
         // 3. ACF Field Injection via Validated JSON Keys
         if ( ! $dry_run ) {
-            update_field( 'field_69aa920b6893c', array_unique( $facilities ), $post_id );
-            update_field( 'field_69aa958818e50', array_unique( $expertise ), $post_id );
             
-            if ( $bedrooms ) update_field( 'field_69aa9338e1174', $bedrooms, $post_id );
-            if ( $ensuite ) update_field( 'field_69c3c065ee56d', $ensuite, $post_id );
+            // Universal Injections applicable to both scopes
             if ( $cqc_id ) update_field( 'field_69aaa93fb0482', $cqc_id, $post_id );
 
             // Dynamically evaluate sideloaded images against strict gallery configurations using exact JSON Keys
@@ -497,16 +477,6 @@ class WPSL_Custom_XML_Importer {
                 $log .= "    [Info] Mapped " . count( $unique_gallery ) . " images to sequential ACF gallery_image fields.\n";
             }
             
-            // Two Columns Block Fields Migration
-            if ( ! empty( $two_columns_image ) && isset( $attachments[ $two_columns_image ] ) ) {
-                $new_image_id = $this->sideload_image( $attachments[ $two_columns_image ] );
-                if ( $new_image_id ) update_field( 'field_69aa9611c232c', $new_image_id, $post_id );
-            }
-            if ( ! empty( $two_cols_heading ) ) update_field( 'field_69aa9621c232d', $two_cols_heading, $post_id );
-            if ( ! empty( $two_cols_content ) ) update_field( 'field_69aa9629c232e', $two_cols_content, $post_id );
-            if ( ! empty( $two_columns_btn_text ) ) update_field( 'field_69aa983bc9e6d', $two_columns_btn_text, $post_id );
-            if ( ! empty( $two_columns_btn_link ) ) update_field( 'field_69aa9848c9e6e', $two_columns_btn_link, $post_id );
-
             if ( ! empty( $meta['_thumbnail_id'] ) && isset( $attachments[ $meta['_thumbnail_id'] ] ) ) {
                 $url = $attachments[ $meta['_thumbnail_id'] ];
                 $new_thumb_id = $this->sideload_image( $url );
@@ -514,9 +484,27 @@ class WPSL_Custom_XML_Importer {
                     set_post_thumbnail( $post_id, $new_thumb_id );
                 }
             }
+
+            // Scope-restrained injections (Only map secondary arrays if utilizing the modern architecture)
+            if ( $import_type === 'new_locations' ) {
+                update_field( 'field_69aa920b6893c', array_unique( $facilities ), $post_id );
+                update_field( 'field_69aa958818e50', array_unique( $expertise ), $post_id );
+                
+                if ( $bedrooms ) update_field( 'field_69aa9338e1174', $bedrooms, $post_id );
+                if ( $ensuite ) update_field( 'field_69c3c065ee56d', $ensuite, $post_id );
+                
+                if ( ! empty( $two_columns_image ) && isset( $attachments[ $two_columns_image ] ) ) {
+                    $new_image_id = $this->sideload_image( $attachments[ $two_columns_image ] );
+                    if ( $new_image_id ) update_field( 'field_69aa9611c232c', $new_image_id, $post_id );
+                }
+                if ( ! empty( $two_cols_heading ) ) update_field( 'field_69aa9621c232d', $two_cols_heading, $post_id );
+                if ( ! empty( $two_cols_content ) ) update_field( 'field_69aa9629c232e', $two_cols_content, $post_id );
+                if ( ! empty( $two_columns_btn_text ) ) update_field( 'field_69aa983bc9e6d', $two_columns_btn_text, $post_id );
+                if ( ! empty( $two_columns_btn_link ) ) update_field( 'field_69aa9848c9e6e', $two_columns_btn_link, $post_id );
+            }
         }
 
-        // 4. Migrate Native WP Store Locator Data Mapping
+        // 4. Migrate Native WP Store Locator Data Mapping (Universal)
         if ( ! $dry_run ) {
             $wpsl_fields_count = 0;
 
@@ -547,11 +535,9 @@ class WPSL_Custom_XML_Importer {
         }
 
         $log .= sprintf(
-            "    [Success] Compiled -> %d Facilities | %d Expertise | %s Beds | %s Ensuites | CQC: %s | %d Images Found.\n",
+            "    [Success] Compiled -> %d Facilities | %d Expertise | CQC: %s | %d Images Found.\n",
             count( $facilities ),
             count( $expertise ),
-            ( $bedrooms ? $bedrooms : '0' ),
-            ( $ensuite ? $ensuite : '0' ),
             ( $cqc_id ? $cqc_id : 'N/A' ),
             count( $gallery_ids )
         );
