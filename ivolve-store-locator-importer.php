@@ -1782,7 +1782,7 @@ if ( is_admin() ) {
 			echo '<ul>';
 			foreach ( (array) $report as $k => $v ) {
 				echo '<li><strong>' . esc_html( (string) $k ) . ':</strong> ' . esc_html( (string) $v ) . '</li>';
-			}
+				}
 			echo '</ul>';
 			echo '<p>If the dry run succeeded, run again with dry run unchecked.</p>';
 			echo '</div>';
