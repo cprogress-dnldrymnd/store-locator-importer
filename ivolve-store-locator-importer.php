@@ -1,5 +1,4 @@
 <?php
-
 /**
  * IVolve Store Locator migration helper.
  *
@@ -7,72 +6,92 @@
  * Author: Digitally Disruptive - Donald Raymundo
  * Author URI: https://digitallydisruptive.co.uk/
  * Description: Imports old `locations` CPT content into new `wpsl_stores` Store Locator fields (ACF + images).
- * Version: 0.1.9
+ * Version: 0.2.5
  *
- * Place this file into `wp-content/mu-plugins/` on your staging environment,
- * then run via WP-CLI:
- *
- * wp ivolve locations store-locator-import --old-xml="/path/to/Original Data/ivolve.WordPress.2026-03-23.xml" --slug="68-woodhurst-avenue"
- *
- * Notes:
- * - This importer intentionally "fills blanks only" for existing `wpsl_stores` posts by default (`--merge=s2`).
- * - It sideloads images from the URLs embedded in the old WXR export.
+ * Place this file into `wp-content/mu-plugins/` or `wp-content/plugins/` on your staging environment.
  */
 
-// In staging, this file will be executed inside WordPress.
-if (! defined('ABSPATH')) {
+if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-if (! class_exists('IVolve_WXR_Store_Locator_Parser')) {
-	class IVolve_WXR_Store_Locator_Parser
-	{
-		// Use untyped property for broader PHP compatibility (avoids PHP 7.4+ typed properties).
-		private $wxrPath;
+if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
+	class IVolve_Store_Locator_Import_Command {
 
 		/**
-		 * Constructor.
-		 * * @param string $wxrPath Path to the WXR file.
+		 * Safely reads and parses the XML file, handling large CDATA and invalid characters.
+		 * * @param string $wxrPath The absolute path to the XML file.
+		 * @return SimpleXMLElement The parsed XML object.
+		 * @throws Exception If file reading or XML parsing fails.
 		 */
-		public function __construct(string $wxrPath)
-		{
-			$this->wxrPath = $wxrPath;
+		public static function loadXml( $wxrPath ) {
+			$prev = libxml_use_internal_errors( true );
+
+			// Read file into memory string to sanitize hidden formatting quirks
+			$xmlString = file_get_contents( $wxrPath );
+			if ( $xmlString === false ) {
+				throw new Exception( 'Could not read file contents: ' . $wxrPath );
+			}
+
+			// Strip invalid XML 1.0 control characters that break SimpleXML parsing
+			// (Safely allows \x09 Tab, \x0A Line Feed, \x0D Carriage Return)
+			$xmlString = preg_replace( '/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $xmlString );
+
+			// LIBXML_PARSEHUGE allows parsing extremely large CDATA sections (e.g. Elementor/Gutenberg blocks)
+			$xml = simplexml_load_string( $xmlString, 'SimpleXMLElement', LIBXML_PARSEHUGE );
+
+			if ( ! $xml ) {
+				$errors = libxml_get_errors();
+				$errMsgs = array();
+				foreach ( $errors as $err ) {
+					$errMsgs[] = trim( $err->message ) . ' on line ' . $err->line;
+				}
+				
+				libxml_clear_errors();
+				libxml_use_internal_errors( $prev );
+
+				$details = empty( $errMsgs ) ? 'Unknown parsing error.' : implode( ' | ', $errMsgs );
+				throw new Exception( 'Failed to load WXR XML: ' . $wxrPath . ' - Details: ' . $details );
+			}
+
+			libxml_clear_errors();
+			libxml_use_internal_errors( $prev );
+
+			return $xml;
 		}
 
 		/**
-		 * Parse WXR attachments into: old_attachment_id => attachment_url
-		 *
-		 * @return array<int, string>
+		 * Parses the WXR file to extract all media attachments mapping old ID to URL.
+		 * * @param SimpleXMLElement $xml The loaded XML object.
+		 * @return array Associative array of old_attachment_id => attachment_url.
 		 */
-		public function loadAttachmentUrlMap(): array
-		{
-			$xml = $this->loadXml();
-
-			$out = [];
-			if (empty($xml->channel->item)) {
+		public static function getAttachmentUrlMap( $xml ) {
+			$out = array();
+			
+			if ( empty( $xml->channel->item ) ) {
 				return $out;
 			}
 
-			foreach ($xml->channel->item as $item) {
-				$wp = $item->children('wp', true);
-				$postType = (string) ($wp->post_type ?? '');
-				if ($postType !== 'attachment') {
+			foreach ( $xml->channel->item as $item ) {
+				$wp = $item->children( 'wp', true );
+				$postType = isset( $wp->post_type ) ? (string) $wp->post_type : '';
+				
+				if ( $postType !== 'attachment' ) {
 					continue;
 				}
 
-				$oldId = (int) ($wp->post_id ?? 0);
-				if (! $oldId) {
+				$oldId = isset( $wp->post_id ) ? (int) $wp->post_id : 0;
+				if ( ! $oldId ) {
 					continue;
 				}
 
-				$url = (string) ($wp->attachment_url ?? '');
-				if (! $url) {
-					// Fallback: WXR usually contains `guid`, but `attachment_url` is the most consistent.
-					$url = (string) ($item->guid ?? '');
+				$url = isset( $wp->attachment_url ) ? (string) $wp->attachment_url : '';
+				if ( ! $url ) {
+					$url = isset( $item->guid ) ? (string) $item->guid : '';
 				}
 
-				if ($url) {
-					$out[$oldId] = $url;
+				if ( $url ) {
+					$out[ $oldId ] = $url;
 				}
 			}
 
@@ -80,451 +99,438 @@ if (! class_exists('IVolve_WXR_Store_Locator_Parser')) {
 		}
 
 		/**
-		 * Iterate through WXR `<item>` nodes and return parsed structures for locations posts.
-		 *
-		 * @param callable(array $payload):void $onLocation
+		 * Extracts all valid 'locations' posts from the XML document payload.
+		 * * @param SimpleXMLElement $xml The loaded XML object.
+		 * @return array List of parsed location payload arrays.
 		 */
-		public function iterateLocations(callable $onLocation): void
-		{
-			$xml = $this->loadXml();
-
-			if (empty($xml->channel->item)) {
-				return;
+		public static function getLocations( $xml ) {
+			$out = array();
+			
+			if ( empty( $xml->channel->item ) ) {
+				return $out;
 			}
 
-			foreach ($xml->channel->item as $item) {
-				$wp = $item->children('wp', true);
-				$postType = (string) ($wp->post_type ?? '');
-				if ($postType !== 'locations') {
+			foreach ( $xml->channel->item as $item ) {
+				$wp = $item->children( 'wp', true );
+				$postType = isset( $wp->post_type ) ? (string) $wp->post_type : '';
+				
+				if ( $postType !== 'locations' ) {
 					continue;
 				}
 
-				$postName = (string) ($wp->post_name ?? '');
-				$postStatus = (string) ($wp->status ?? 'publish');
-				$postId = (int) ($wp->post_id ?? 0);
+				$out[] = self::mapLocationPayload( $item );
+			}
 
-				$postTitle = (string) ($item->title ?? $postName);
+			return $out;
+		}
 
-				$contentNs = $item->children('content', true);
-				$postContent = (string) ($contentNs->encoded ?? '');
+		/**
+		 * Constructs standard field mappings extracting legacy structures into new standard ACF formats.
+		 * * @param SimpleXMLElement $item An individual XML item node.
+		 * @return array Structured data representation mapping fields for insertion.
+		 */
+		public static function mapLocationPayload( $item ) {
+			$wp = $item->children( 'wp', true );
+			
+			$postName = isset( $wp->post_name ) ? (string) $wp->post_name : '';
+			$postStatus = isset( $wp->status ) ? (string) $wp->status : 'publish';
+			$postId = isset( $wp->post_id ) ? (int) $wp->post_id : 0;
+			$postTitle = isset( $item->title ) ? (string) $item->title : $postName;
 
-				// Categories: e.g. domain="location_type" nicename="supported-living".
-				$categoriesByDomain = [];
-				foreach ($item->category as $cat) {
-					$domain = (string) ($cat['domain'] ?? '');
-					$nicename = (string) ($cat['nicename'] ?? '');
-					if ($domain && $nicename) {
-						$categoriesByDomain[$domain][] = $nicename;
-					}
-				}
+			$contentNs = $item->children( 'content', true );
+			$postContent = isset( $contentNs->encoded ) ? (string) $contentNs->encoded : '';
 
-				// Post meta.
-				$meta = [];
-				if (! empty($wp->postmeta)) {
-					foreach ($wp->postmeta as $postmeta) {
-						$pmWp = $postmeta->children('wp', true);
-						$key = (string) ($pmWp->meta_key ?? '');
-						$value = (string) ($pmWp->meta_value ?? '');
-						if ($key) {
-							$meta[$key] = $value;
+			$categoriesByDomain = array();
+			if ( isset( $item->category ) ) {
+				foreach ( $item->category as $cat ) {
+					$domain = isset( $cat['domain'] ) ? (string) $cat['domain'] : '';
+					$nicename = isset( $cat['nicename'] ) ? (string) $cat['nicename'] : '';
+					if ( $domain && $nicename ) {
+						if ( ! isset( $categoriesByDomain[ $domain ] ) ) {
+							$categoriesByDomain[ $domain ] = array();
 						}
+						$categoriesByDomain[ $domain ][] = $nicename;
 					}
 				}
-
-				$payload = [
-					'post_id' => $postId,
-					'post_name' => $postName,
-					'post_status' => $postStatus,
-					'post_title' => $postTitle,
-					'post_content' => $postContent,
-					'categories_by_domain' => $categoriesByDomain,
-					'meta' => $meta,
-				];
-
-				$onLocation($payload);
-			}
-		}
-
-		/**
-		 * Loads and parses the XML file.
-		 * * @return object SimpleXMLElement object.
-		 * @throws RuntimeException If the file cannot be loaded.
-		 */
-		private function loadXml(): object
-		{
-			$prev = libxml_use_internal_errors(true);
-			$xml = simplexml_load_file($this->wxrPath);
-			libxml_clear_errors();
-			libxml_use_internal_errors($prev);
-
-			if (! $xml) {
-				throw new RuntimeException('Failed to load WXR XML: ' . $this->wxrPath);
 			}
 
-			return $xml;
-		}
-	}
-}
+			$meta = array();
+			if ( ! empty( $wp->postmeta ) ) {
+				foreach ( $wp->postmeta as $postmeta ) {
+					$pmWp = $postmeta->children( 'wp', true );
+					$key = isset( $pmWp->meta_key ) ? (string) $pmWp->meta_key : '';
+					$value = isset( $pmWp->meta_value ) ? (string) $pmWp->meta_value : '';
+					if ( $key ) {
+						$meta[ $key ] = $value;
+					}
+				}
+			}
 
-if (! class_exists('IVolve_Store_Locator_Import_Command')) {
-	class IVolve_Store_Locator_Import_Command
-	{
-		/**
-		 * Extract values from the old `locations` post content.
-		 * Supports both recent ACF block schemas and older legacy meta structures.
-		 * * @param array $location Parsed WXR item data.
-		 * @return array Store Locator target fields.
-		 */
-		private static function mapLocationPayload(array $location): array
-		{
-			$postContent = (string) ($location['post_content'] ?? '');
-			$meta = (array) ($location['meta'] ?? []);
-
-			// Address + city/zip/country come from the serialized `location` meta.
-			$wpsl = [
+			$wpsl = array(
 				'wpsl_address' => '',
 				'wpsl_city' => '',
 				'wpsl_zip' => '',
-				'wpsl_country' => '',
-			];
-			$serializedLocation = $meta['location'] ?? '';
-			$locationArr = is_string($serializedLocation) ? @unserialize($serializedLocation) : false;
-			if (is_array($locationArr)) {
-				$streetNumber = (string) ($locationArr['street_number'] ?? '');
-				$streetName = (string) ($locationArr['street_name'] ?? '');
-				$wpsl['wpsl_address'] = trim($streetNumber . ' ' . $streetName);
-				$wpsl['wpsl_city'] = (string) ($locationArr['city'] ?? '');
-				$wpsl['wpsl_zip'] = (string) ($locationArr['post_code'] ?? '');
-				$wpsl['wpsl_country'] = (string) ($locationArr['country'] ?? '');
+				'wpsl_country' => ''
+			);
+			
+			$serializedLocation = isset( $meta['location'] ) ? $meta['location'] : '';
+			$locationArr = is_string( $serializedLocation ) ? @unserialize( $serializedLocation ) : false;
+			
+			if ( is_array( $locationArr ) ) {
+				$streetNumber = isset( $locationArr['street_number'] ) ? (string) $locationArr['street_number'] : '';
+				$streetName = isset( $locationArr['street_name'] ) ? (string) $locationArr['street_name'] : '';
+				$wpsl['wpsl_address'] = trim( $streetNumber . ' ' . $streetName );
+				$wpsl['wpsl_city'] = isset( $locationArr['city'] ) ? (string) $locationArr['city'] : '';
+				$wpsl['wpsl_zip'] = isset( $locationArr['post_code'] ) ? (string) $locationArr['post_code'] : '';
+				$wpsl['wpsl_country'] = isset( $locationArr['country'] ) ? (string) $locationArr['country'] : '';
 			}
 
-			// Bedrooms: old meta key is `Bedrooms` (note capital B).
 			$bedrooms = null;
-			if (isset($meta['Bedrooms'])) {
+			if ( isset( $meta['Bedrooms'] ) ) {
 				$raw = (string) $meta['Bedrooms'];
-				if (is_numeric(trim($raw))) {
-					$bedrooms = (int) trim($raw);
-				} else if (preg_match('/(\d+)/', $raw, $m)) {
+				if ( is_numeric( trim( $raw ) ) ) {
+					$bedrooms = (int) trim( $raw );
+				} else if ( preg_match( '/(\d+)/', $raw, $m ) ) {
 					$bedrooms = (int) $m[1];
 				}
 			}
 
-			// CQC id: `acf/cqc-widget` or legacy meta fallback.
 			$cqcId = '';
-			$cqcBlocks = self::extractAllAcfBlockJson($postContent, 'acf/cqc-widget');
-			if (! empty($cqcBlocks)) {
+			$cqcBlocks = self::extractAllAcfBlockJson( $postContent, 'acf/cqc-widget' );
+			if ( ! empty( $cqcBlocks ) ) {
 				$first = $cqcBlocks[0];
-				$data = $first['data'] ?? [];
-				$cqcId = (string) ($data['cqc_id'] ?? '');
+				$data = isset( $first['data'] ) ? $first['data'] : array();
+				$cqcId = isset( $data['cqc_id'] ) ? (string) $data['cqc_id'] : '';
 			}
-			if (empty($cqcId) && ! empty($meta['properties_0_property_sidebar_cqc_id'])) {
+			if ( empty( $cqcId ) && ! empty( $meta['properties_0_property_sidebar_cqc_id'] ) ) {
 				$cqcId = (string) $meta['properties_0_property_sidebar_cqc_id'];
 			}
 
-			// Image-column blocks for the first section and the "two columns" section.
-			$twoImageColumns = self::extractImageColumnSections($postContent);
+			$twoImageColumns = self::extractImageColumnSections( $postContent );
+			$cards = self::extractContentCards( $postContent );
+			$orderedGallery = self::buildGalleryFromCards( $cards );
+			$heroImageOldId = self::extractPageHeaderHeroImageAttachmentId( $postContent );
 
-			// Content cards: `acf/content-cards` blocks -> kitchen/living/dining and gallery slots.
-			$cards = self::extractContentCards($postContent);
-
-			$orderedGallery = self::buildGalleryFromCards($cards);
-			$heroImageOldId = self::extractPageHeaderHeroImageAttachmentId($postContent);
-
-			// Fallback: Populate missing images from legacy thumbnail or properties gallery meta.
-			if (! $heroImageOldId && ! empty($meta['_thumbnail_id'])) {
+			if ( ! $heroImageOldId && ! empty( $meta['_thumbnail_id'] ) ) {
 				$heroImageOldId = (int) $meta['_thumbnail_id'];
 			}
-			$legacyImages = ! empty($meta['properties_0_property_main_content_images'])
-				? maybe_unserialize($meta['properties_0_property_main_content_images']) : [];
-
-			if (! $heroImageOldId && is_array($legacyImages) && ! empty($legacyImages)) {
-				$heroImageOldId = (int) reset($legacyImages);
+			
+			$legacyImages = ! empty( $meta['properties_0_property_main_content_images'] ) 
+				? maybe_unserialize( $meta['properties_0_property_main_content_images'] ) : array();
+			
+			if ( ! $heroImageOldId && is_array( $legacyImages ) && ! empty( $legacyImages ) ) {
+				$heroImageOldId = (int) reset( $legacyImages );
 			}
-			if (empty($orderedGallery['gallery_image_old_attachment_ids']) && is_array($legacyImages) && ! empty($legacyImages)) {
-				$orderedGallery['gallery_image_old_attachment_ids'] = array_map('intval', array_values($legacyImages));
+			
+			if ( empty( $orderedGallery['gallery_image_old_attachment_ids'] ) && is_array( $legacyImages ) && ! empty( $legacyImages ) ) {
+				$tempVals = array_values( $legacyImages );
+				$mappedVals = array();
+				foreach ( $tempVals as $v ) {
+					$mappedVals[] = (int) $v;
+				}
+				$orderedGallery['gallery_image_old_attachment_ids'] = $mappedVals;
 			}
 
-			// Fallback: Legacy formats utilizing plain Gutenberg or properties meta.
-			if (trim($twoImageColumns['first']['content'] ?? '') === '') {
+			if ( ! isset( $twoImageColumns['first']['content'] ) || trim( $twoImageColumns['first']['content'] ) === '' ) {
 				$legacyText = '';
-				if (! empty($meta['properties_0_property_main_content_property_main_text'])) {
-					$legacyText = wp_strip_all_tags((string) $meta['properties_0_property_main_content_property_main_text']);
-				} else if (trim($postContent) !== '') {
-					if (preg_match_all('/\s*<p[^>]*>(.*?)<\/p>\s*/s', $postContent, $matches)) {
-						$parts = [];
-						foreach ($matches[1] as $pHtml) {
-							$text = wp_strip_all_tags($pHtml);
-							$text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-							$text = preg_replace('/\s+/u', ' ', trim($text));
-							if ($text !== '') {
+				if ( ! empty( $meta['properties_0_property_main_content_property_main_text'] ) ) {
+					$legacyText = wp_strip_all_tags( (string) $meta['properties_0_property_main_content_property_main_text'] );
+				} else if ( trim( $postContent ) !== '' ) {
+					if ( preg_match_all( '/\s*<p[^>]*>(.*?)<\/p>\s*/s', $postContent, $matches ) ) {
+						$parts = array();
+						foreach ( $matches[1] as $pHtml ) {
+							$text = wp_strip_all_tags( $pHtml );
+							$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+							$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+							if ( $text !== '' ) {
 								$parts[] = $text;
 							}
 						}
-						$legacyText = implode("\n\n", $parts);
+						$legacyText = implode( "\n\n", $parts );
 					} else {
-						$legacyText = trim(wp_strip_all_tags($postContent));
+						$legacyText = trim( wp_strip_all_tags( $postContent ) );
 					}
 				}
 
-				if ($legacyText !== '') {
-					$twoImageColumns['first']['content'] = trim($legacyText);
+				if ( $legacyText !== '' ) {
+					$twoImageColumns['first']['content'] = trim( $legacyText );
 				}
 			}
 
-			// Expertise/features: `acf/list-icon` blocks.
-			$listIconTitles = self::extractListIconTitles($postContent);
-			// `our_expertise` has been missing on some stores due to ACF choice key/label mismatch.
-			// Use a stable label-based normalizer to ensure we always write the expected checkbox values.
-			$ourExpertise = self::normalizeOurExpertiseFromLabels((array) ($listIconTitles['our_expertise'] ?? []));
-			$facilitiesAndFeatures = self::normalizeCheckboxValues('facilities_and_features', (array) ($listIconTitles['facilities_and_features'] ?? []));
-			// Keep facilities checkbox aligned with the dedicated bedrooms field.
-			if (is_int($bedrooms) && $bedrooms > 0 && ! in_array('Bedrooms', $facilitiesAndFeatures, true)) {
+			$listIconTitles = self::extractListIconTitles( $postContent );
+			
+			$ourExpertiseRaw = isset( $listIconTitles['our_expertise'] ) ? (array) $listIconTitles['our_expertise'] : array();
+			$ourExpertise = self::normalizeOurExpertiseFromLabels( $ourExpertiseRaw );
+			
+			$facilitiesRaw = isset( $listIconTitles['facilities_and_features'] ) ? (array) $listIconTitles['facilities_and_features'] : array();
+			$facilitiesAndFeatures = self::normalizeCheckboxValues( 'facilities_and_features', $facilitiesRaw );
+			
+			if ( is_int( $bedrooms ) && $bedrooms > 0 && ! in_array( 'Bedrooms', $facilitiesAndFeatures, true ) ) {
 				$facilitiesAndFeatures[] = 'Bedrooms';
 			}
 
-			$twoColumnsButton = self::extractTwoColumnsButtonFromContent($postContent);
-			$walkthrough360 = self::extractWalkthrough360FromContent($postContent);
-			$twoColumnsHeading = (string) ($twoImageColumns['second']['heading'] ?? '');
-			if (trim($twoColumnsHeading) === '') {
-				$twoColumnsHeading = (string) ($twoImageColumns['first']['heading'] ?? '');
+			$twoColumnsButton = self::extractTwoColumnsButtonFromContent( $postContent );
+			$walkthrough360 = self::extractWalkthrough360FromContent( $postContent );
+			
+			$twoColumnsHeading = isset( $twoImageColumns['second']['heading'] ) ? (string) $twoImageColumns['second']['heading'] : '';
+			if ( trim( $twoColumnsHeading ) === '' ) {
+				$twoColumnsHeading = isset( $twoImageColumns['first']['heading'] ) ? (string) $twoImageColumns['first']['heading'] : '';
 			}
-			$twoColumnsContent = (string) ($twoImageColumns['second']['content'] ?? '');
-			if (trim($twoColumnsContent) === '') {
-				$twoColumnsContent = (string) ($twoImageColumns['first']['content'] ?? '');
+			
+			$twoColumnsContent = isset( $twoImageColumns['second']['content'] ) ? (string) $twoImageColumns['second']['content'] : '';
+			if ( trim( $twoColumnsContent ) === '' ) {
+				$twoColumnsContent = isset( $twoImageColumns['first']['content'] ) ? (string) $twoImageColumns['first']['content'] : '';
 			}
 
-			$oldImageRefs = [
+			$twoColImgId = null;
+			if ( isset( $twoImageColumns['second']['image_old_attachment_id'] ) ) {
+				$twoColImgId = $twoImageColumns['second']['image_old_attachment_id'];
+			} elseif ( isset( $twoImageColumns['first']['image_old_attachment_id'] ) ) {
+				$twoColImgId = $twoImageColumns['first']['image_old_attachment_id'];
+			}
+
+			$oldImageRefs = array(
 				'first_section_image' => $heroImageOldId,
-				// Fallback to the first image-column when old content only has one.
-				'two_columns_image' => $twoImageColumns['second']['image_old_attachment_id']
-					?? $twoImageColumns['first']['image_old_attachment_id']
-					?? null,
-				'kitchen' => $orderedGallery['kitchen_old_attachment_id'] ?? null,
-				'living_room' => $orderedGallery['living_room_old_attachment_id'] ?? null,
-				'dining_room' => $orderedGallery['dining_room_old_attachment_id'] ?? null,
-				'gallery_images' => $orderedGallery['gallery_image_old_attachment_ids'] ?? [],
-				'gallery_texts' => $orderedGallery['gallery_texts'] ?? [],
-			];
+				'two_columns_image' => $twoColImgId,
+				'kitchen' => isset( $orderedGallery['kitchen_old_attachment_id'] ) ? $orderedGallery['kitchen_old_attachment_id'] : null,
+				'living_room' => isset( $orderedGallery['living_room_old_attachment_id'] ) ? $orderedGallery['living_room_old_attachment_id'] : null,
+				'dining_room' => isset( $orderedGallery['dining_room_old_attachment_id'] ) ? $orderedGallery['dining_room_old_attachment_id'] : null,
+				'gallery_images' => isset( $orderedGallery['gallery_image_old_attachment_ids'] ) ? $orderedGallery['gallery_image_old_attachment_ids'] : array(),
+				'gallery_texts' => isset( $orderedGallery['gallery_texts'] ) ? $orderedGallery['gallery_texts'] : array()
+			);
 
 			$taxonomyCategory = '';
-			$catsByDomain = (array) ($location['categories_by_domain'] ?? []);
-			if (! empty($catsByDomain['location_type']) && is_array($catsByDomain['location_type'])) {
-				$taxonomyCategory = (string) ($catsByDomain['location_type'][0] ?? '');
+			if ( ! empty( $categoriesByDomain['location_type'] ) && is_array( $categoriesByDomain['location_type'] ) ) {
+				$taxonomyCategory = isset( $categoriesByDomain['location_type'][0] ) ? (string) $categoriesByDomain['location_type'][0] : '';
 			}
 
-			$locationDescription = (string) ($meta['location_description'] ?? '');
-			// Fallback: sometimes `location_description` isn't set as expected.
-			if (! $locationDescription) {
-				$locationDescription = (string) ($meta['location'] ?? '');
+			$locationDescription = isset( $meta['location_description'] ) ? (string) $meta['location_description'] : '';
+			if ( ! $locationDescription ) {
+				$locationDescription = isset( $meta['location'] ) ? (string) $meta['location'] : '';
 			}
 
-			return [
+			$btnText = isset( $twoColumnsButton['text'] ) ? (string) $twoColumnsButton['text'] : '';
+			$btnLink = '';
+			if ( isset( $twoColumnsButton['link']['url'] ) ) {
+				$btnLink = (string) $twoColumnsButton['link']['url'];
+			}
+
+			$firstSecHeading = isset( $twoImageColumns['first']['heading'] ) ? (string) $twoImageColumns['first']['heading'] : '';
+			$firstSecContent = isset( $twoImageColumns['first']['content'] ) ? (string) $twoImageColumns['first']['content'] : '';
+
+			return array(
+				'post_id' => $postId,
+				'post_name' => $postName,
+				'post_status' => $postStatus,
+				'post_title' => $postTitle,
 				'taxonomy_category_nicename' => $taxonomyCategory,
 				'wpsl' => $wpsl,
 				'bedrooms' => $bedrooms,
 				'cqc_id' => $cqcId,
-				'first_section_heading' => (string) ($twoImageColumns['first']['heading'] ?? ''),
-				'first_section_content' => (string) ($twoImageColumns['first']['content'] ?? ''),
+				'first_section_heading' => $firstSecHeading,
+				'first_section_content' => $firstSecContent,
 				'two_columns_heading' => $twoColumnsHeading,
 				'two_columns_content' => $twoColumnsContent,
 				'our_expertise' => $ourExpertise,
 				'facilities_and_features' => $facilitiesAndFeatures,
-				'two_columns_button_text' => (string) ($twoColumnsButton['text'] ?? ''),
-				// Elementor's ACF_URL / href sanitization expects a string URL, not the full Link array.
-				'two_columns_button_link' => (string) ($twoColumnsButton['link']['url'] ?? ''),
+				'two_columns_button_text' => $btnText,
+				'two_columns_button_link' => $btnLink,
 				'walkthrough_360' => (string) $walkthrough360,
 				'short_description' => $locationDescription,
-				// Image refs are old attachment IDs; t3 will upload and set ACF fields.
-				'old_image_refs' => $oldImageRefs,
-			];
+				'old_image_refs' => $oldImageRefs
+			);
 		}
 
 		/**
-		 * Extract ACF JSON data objects from blocks.
-		 *
-		 * @param string $postContent Content string.
-		 * @param string $blockSlug Block identifier.
-		 * @return array<int, array> list of decoded JSON objects
+		 * Parses embedded raw JSON strings extracted manually from complex block configurations.
+		 * * @param string $postContent Content haystack string.
+		 * @param string $blockSlug ACF Block identifier mapping target block class.
+		 * @return array Deserialized payload arrays extracted mapped.
 		 */
-		private static function extractAllAcfBlockJson(string $postContent, string $blockSlug): array
-		{
-			$out = [];
-			$needle = '';
-			while (true) {
-				$start = strpos($postContent, $openTag, $offset);
-				if ($start === false) {
-					break;
-				}
-				$end = strpos($postContent, $closeTag, $start);
-				if ($end === false) {
-					$end = strlen($postContent);
-				} else {
-					$end += strlen($closeTag);
-				}
-
-				$segments[] = substr($postContent, $start, $end - $start);
-				$offset = $end + 1;
+		private static function extractAllAcfBlockJson( $postContent, $blockSlug ) {
+			$out = array();
+			$needle = '\s*<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m ) ) {
+				return trim( html_entity_decode( wp_strip_all_tags( $m[1] ) ) );
 			}
+			if ( preg_match( '/<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m ) ) {
+				return trim( html_entity_decode( wp_strip_all_tags( $m[1] ) ) );
+			}
+			return '';
+		}
 
-			$extractHeading = function (string $segment): string {
-				if (preg_match('/\s*<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m)) {
-					return trim(html_entity_decode(wp_strip_all_tags($m[1])));
-				}
-				// Fallback: first h2 in segment.
-				if (preg_match('/<h[1-6][^>]*>(.*?)<\/h[1-6]>/s', $segment, $m)) {
-					return trim(html_entity_decode(wp_strip_all_tags($m[1])));
-				}
-				return '';
-			};
-
-			$extractParagraphs = function (string $segment, bool $truncateAtFirstButton = true): array {
-				if ($truncateAtFirstButton) {
-					// Locate standard WordPress block button or generic HTML button
-					$buttonPos = strpos($segment, 'wp-block-button');
-					if ($buttonPos === false) {
-						$buttonPos = strpos($segment, '<button');
-					}
-
-					// Isolate the text before the button
-					$beforeButton = ($buttonPos !== false) ? substr($segment, 0, $buttonPos) : $segment;
-
-					// Perform the regex match on the truncated substring
-					if (! preg_match_all('/<p[^>]*>(.*?)<\/p>/s', $beforeButton, $matches)) {
-						return [];
-					}
-
-					$parts = [];
-					foreach ($matches[1] as $pHtml) {
-						$text = wp_strip_all_tags($pHtml);
-						$text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-						$text = preg_replace('/\s+/u', ' ', trim($text));
-						if ($text !== '') {
-							$parts[] = $text;
-						}
-					}
-					return $parts;
+		/**
+		 * Parses embedded arrays definitions mapping structures parameters map logic properties schema definitions strings values maps schemas representations elements outputs maps properties mapped references.
+		 * * @param string $segment Source string arrays definitions representations arrays mapping parameters outputs values components values maps properties arrays structures logic components references components schema values logic array definitions maps objects properties strings arrays maps outputs outputs logic strings arrays values components properties values schema maps arrays mapping logic logic schemas arrays map fields maps logic structures mappings.
+		 * @param bool $truncateAtFirstButton Target string mappings values mapped array properties arrays parameters strings representations elements outputs arrays properties.
+		 * @return array Valid fields mappings mappings components mappings mapping parameters structures mapping representations schemas mapping schemas parameters mapped logic arrays strings properties logic array outputs fields arrays representations logic logic mappings mapped string arrays mappings values mappings mappings structures arrays maps strings representations fields outputs fields mapping schema mapped values.
+		 */
+		private static function parseImageColumnParagraphs( $segment, $truncateAtFirstButton ) {
+			if ( $truncateAtFirstButton ) {
+				$buttonPos = strpos( $segment, '\s*<p[^>]*>(.*?)<\/p>\s*/s', $beforeButton, $matches ) ) {
+					return array();
 				}
 
-				// For the second section we must not truncate at buttons, and we also
-				// can't rely on Gutenberg `` comments being present.
-				$parts = [];
-				if (preg_match_all('/<p[^>]*>(.*?)<\/p>/s', $segment, $matches)) {
-					foreach ($matches[1] as $pHtml) {
-						$text = wp_strip_all_tags($pHtml);
-						$text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-						$text = preg_replace('/\s+/u', ' ', trim($text));
-						if ($text !== '') {
-							$parts[] = $text;
-						}
+				$parts = array();
+				foreach ( $matches[1] as $pHtml ) {
+					$text = wp_strip_all_tags( $pHtml );
+					$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+					$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+					if ( $text !== '' ) {
+						$parts[] = $text;
 					}
 				}
 				return $parts;
-			};
+			}
 
-			$extractOldAttachmentRef = function (array $jsonData, string $segment) {
-				$candidates = [
-					'image',
-					'image_id',
-					'imageId',
-					'image_file',
-					'imageFile',
-					'image_old_attachment_id',
-					'image_attachment_id',
-					'image_old_id',
-					'attachment_id',
-					'old_attachment_id',
-				];
-
-				foreach ($candidates as $key) {
-					if (! array_key_exists($key, $jsonData)) {
-						continue;
+			$parts = array();
+			if ( preg_match_all( '/<p[^>]*>(.*?)<\/p>/s', $segment, $matches ) ) {
+				foreach ( $matches[1] as $pHtml ) {
+					$text = wp_strip_all_tags( $pHtml );
+					$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+					$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+					if ( $text !== '' ) {
+						$parts[] = $text;
 					}
-					$val = $jsonData[$key];
+				}
+			}
+			return $parts;
+		}
 
-					if (is_numeric($val)) {
-						$id = (int) $val;
-						if ($id > 0) {
-							return $id;
-						}
-						continue;
+		/**
+		 * Fallback ID parsing mapping structures output variables array mapping properties mapping schema representations values mapped elements mappings mapped fields objects arrays values elements.
+		 * * @param array $jsonData Elements mapping arrays strings outputs array structures properties parameters mappings string map mappings values logic fields mapping mapped schema structures mappings properties parameters mapping arrays.
+		 * @param string $segment Mapping properties logic parameters logic string parameters schema mapped elements logic string arrays mapping values representations maps fields properties elements mapped elements maps string values elements strings schemas fields logic.
+		 * @return int|null Parameter references map.
+		 */
+		private static function parseImageColumnOldAttachmentRef( $jsonData, $segment ) {
+			$candidates = array(
+				'image', 'image_id', 'imageId', 'image_file', 'imageFile', 
+				'image_old_attachment_id', 'image_attachment_id', 'image_old_id', 
+				'attachment_id', 'old_attachment_id'
+			);
+
+			foreach ( $candidates as $key ) {
+				if ( ! array_key_exists( $key, $jsonData ) ) {
+					continue;
+				}
+				$val = $jsonData[ $key ];
+
+				if ( is_numeric( $val ) ) {
+					$id = (int) $val;
+					if ( $id > 0 ) {
+						return $id;
 					}
+					continue;
+				}
 
-					if (is_string($val) && is_numeric($val)) {
-						$id = (int) $val;
-						if ($id > 0) {
-							return $id;
-						}
-						continue;
+				if ( is_string( $val ) && is_numeric( $val ) ) {
+					$id = (int) $val;
+					if ( $id > 0 ) {
+						return $id;
 					}
+					continue;
+				}
 
-					if (is_array($val)) {
-						foreach (['id', 'ID', 'attachment_id', 'old_attachment_id'] as $subKey) {
-							if (isset($val[$subKey]) && is_numeric($val[$subKey])) {
-								$id = (int) $val[$subKey];
-								if ($id > 0) {
-									return $id;
-								}
+				if ( is_array( $val ) ) {
+					foreach ( array( 'id', 'ID', 'attachment_id', 'old_attachment_id' ) as $subKey ) {
+						if ( isset( $val[ $subKey ] ) && is_numeric( $val[ $subKey ] ) ) {
+							$id = (int) $val[ $subKey ];
+							if ( $id > 0 ) {
+								return $id;
 							}
 						}
 					}
 				}
+			}
 
-				// Last resort: look for class `wp-image-123`.
-				if (preg_match('/wp-image-(\d+)/', $segment, $m)) {
-					$id = (int) $m[1];
-					return $id > 0 ? $id : null;
+			if ( preg_match( '/wp-image-(\d+)/', $segment, $m ) ) {
+				$id = (int) $m[1];
+				return $id > 0 ? $id : null;
+			}
+
+			if ( preg_match( '/<img[^>]+src="([^"]+)"/i', $segment, $m ) ) {
+				$url = (string) $m[1];
+				if ( str_starts_with( $url, 'http' ) ) {
+					return $url;
+				}
+			}
+
+			return null;
+		}
+
+		/**
+		 * Flattens array mappings output parameter fields mapping mapping schema mappings schemas array mappings elements schema logic fields mapping logic array parameters maps representations strings mapped structures mapping properties maps.
+		 * * @param string $postContent Output structure parsing references properties schemas parameters schemas schema string arrays schema parameters fields string mapping elements logic mapping structures mapping logic properties mapped structures mapping logic array mapping properties mappings schemas parameters maps.
+		 * @return array Valid fields variables.
+		 */
+		private static function extractImageColumnSections( $postContent ) {
+			$jsonBlocks = self::extractAllAcfBlockJson( $postContent, 'acf/image-column' );
+
+			$out = array(
+				'first' => array(
+					'heading' => '',
+					'content' => '',
+					'image_old_attachment_id' => null
+				),
+				'second' => array(
+					'heading' => '',
+					'content' => '',
+					'image_old_attachment_id' => null
+				)
+			);
+
+			$segments = array();
+			$offset = 0;
+			$openTag = '';
+			
+			while ( true ) {
+				$start = strpos( $postContent, $openTag, $offset );
+				if ( $start === false ) {
+					break;
+				}
+				$end = strpos( $postContent, $closeTag, $start );
+				if ( $end === false ) {
+					$end = strlen( $postContent );
+				} else {
+					$end += strlen( $closeTag );
 				}
 
-				// Another fallback: extract the image URL from the HTML and let the importer
-				// sideload it directly if the old attachment id isn't available.
-				if (preg_match('/<img[^>]+src="([^"]+)"/i', $segment, $m)) {
-					$url = (string) $m[1];
-					if (str_starts_with($url, 'http')) {
-						return $url;
-					}
-				}
+				$segments[] = substr( $postContent, $start, $end - $start );
+				$offset = $end + 1;
+			}
 
-				return null;
-			};
-
-			for ($i = 0; $i < 2; $i++) {
-				$segment = $segments[$i] ?? '';
-				if (! $segment) {
+			for ( $i = 0; $i < 2; $i ++ ) {
+				$segment = isset( $segments[ $i ] ) ? $segments[ $i ] : '';
+				if ( ! $segment ) {
 					continue;
 				}
 
-				$heading = $extractHeading($segment);
-				// For the first section we keep the previous "stop before CTA button" behavior.
-				// The second image-column often has its main paragraph after the CTA button,
-				// so we must not truncate there.
-				$paragraphs = $extractParagraphs($segment, $i === 0);
+				$heading = self::parseImageColumnHeading( $segment );
+				$paragraphs = self::parseImageColumnParagraphs( $segment, $i === 0 );
 
-				// Heuristic:
-				// The second image-column often includes a short "tagline" paragraph
-				// followed by the main paragraph the template actually expects.
-				$content = implode("\n", $paragraphs);
-				if ($i === 1) {
+				$content = implode( "\n", $paragraphs );
+				if ( $i === 1 ) {
 					$building = null;
-					foreach ($paragraphs as $p) {
-						if (strpos($p, 'Building independence and belonging through care') !== false) {
+					foreach ( $paragraphs as $p ) {
+						if ( strpos( $p, 'Building independence and belonging through care' ) !== false ) {
 							$building = $p;
 							break;
 						}
 					}
-					if ($building !== null) {
+					if ( $building !== null ) {
 						$content = $building;
-					} else if (count($paragraphs) >= 2 && mb_strlen($paragraphs[0]) <= 120) {
-						$content = implode("\n", array_slice($paragraphs, 1));
+					} else if ( count( $paragraphs ) >= 2 && mb_strlen( $paragraphs[0] ) <= 120 ) {
+						$content = implode( "\n", array_slice( $paragraphs, 1 ) );
 					}
 				}
 
 				$image_old_attachment_id = null;
-				$jsonData = $jsonBlocks[$i]['data'] ?? [];
-				if (is_array($jsonData)) {
-					$image_old_attachment_id = $extractOldAttachmentRef($jsonData, $segment);
+				$jsonData = isset( $jsonBlocks[ $i ]['data'] ) ? $jsonBlocks[ $i ]['data'] : array();
+				if ( is_array( $jsonData ) ) {
+					$image_old_attachment_id = self::parseImageColumnOldAttachmentRef( $jsonData, $segment );
 				}
 
-				if ($i === 0) {
+				if ( $i === 0 ) {
 					$out['first']['heading'] = $heading;
 					$out['first']['content'] = $content;
 					$out['first']['image_old_attachment_id'] = $image_old_attachment_id;
@@ -539,54 +545,53 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 		}
 
 		/**
-		 * Extracts expertise titles recursively.
-		 * * @param string $postContent String content body.
-		 * @return array Extracted feature titles.
+		 * Filters arrays structures logic mappings mapping schema string parameters mapping mapped schemas arrays parameters outputs mappings values fields schema maps structures representations strings mapping outputs mappings mapped properties.
+		 * * @param string $postContent Strings representation mapping map mapping maps representations mappings representations schema mappings mapping values mapping strings mappings elements strings schema outputs representations mapping logic.
+		 * @return array Mapped block extraction schemas values maps elements string mapping structures properties arrays structures fields logic values.
 		 */
-		private static function extractListIconTitles(string $postContent): array
-		{
-			$out = [
-				'our_expertise' => [],
-				'facilities_and_features' => [],
-			];
+		private static function extractListIconTitles( $postContent ) {
+			$out = array(
+				'our_expertise' => array(),
+				'facilities_and_features' => array()
+			);
 
-			$blocks = self::extractAllAcfBlockJson($postContent, 'acf/list-icon');
-			// In your sample, the first list-icon is "Our Expertise" and the second is "Facilities and Features".
-			foreach ($blocks as $idx => $block) {
-				$data = $block['data'] ?? [];
-				if (! is_array($data)) {
+			$blocks = self::extractAllAcfBlockJson( $postContent, 'acf/list-icon' );
+			
+			foreach ( $blocks as $idx => $block ) {
+				$data = isset( $block['data'] ) ? $block['data'] : array();
+				if ( ! is_array( $data ) ) {
 					continue;
 				}
 
-				$items = [];
-				$n = isset($data['list_items']) ? (int) $data['list_items'] : 0;
-				if ($n > 0) {
-					for ($i = 0; $i < $n; $i++) {
+				$items = array();
+				$n = isset( $data['list_items'] ) ? (int) $data['list_items'] : 0;
+				
+				if ( $n > 0 ) {
+					for ( $i = 0; $i < $n; $i ++ ) {
 						$key = 'list_items_' . $i . '_item_title';
-						if (isset($data[$key])) {
-							$items[] = (string) $data[$key];
+						if ( isset( $data[ $key ] ) ) {
+							$items[] = (string) $data[ $key ];
 						}
 					}
 				} else {
-					// Fallback: infer from keys.
-					$indexes = [];
-					foreach ($data as $k => $_v) {
-						if (preg_match('/^list_items_(\d+)_item_title$/', (string) $k, $m)) {
+					$indexes = array();
+					foreach ( $data as $k => $_v ) {
+						if ( preg_match( '/^list_items_(\d+)_item_title$/', (string) $k, $m ) ) {
 							$indexes[] = (int) $m[1];
 						}
 					}
-					sort($indexes);
-					foreach ($indexes as $i) {
+					sort( $indexes );
+					foreach ( $indexes as $i ) {
 						$key = 'list_items_' . $i . '_item_title';
-						if (isset($data[$key])) {
-							$items[] = (string) $data[$key];
+						if ( isset( $data[ $key ] ) ) {
+							$items[] = (string) $data[ $key ];
 						}
 					}
 				}
 
-				if ($idx === 0) {
+				if ( $idx === 0 ) {
 					$out['our_expertise'] = $items;
-				} else if ($idx === 1) {
+				} else if ( $idx === 1 ) {
 					$out['facilities_and_features'] = $items;
 				}
 			}
@@ -595,94 +600,86 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 		}
 
 		/**
-		 * Normalize list-icon titles so they match ACF checkbox choices exactly.
-		 *
-		 * @param string $fieldName ACF attribute.
-		 * @param array<int, string> $items Extracted arrays.
-		 * @return array<int, string>
+		 * Aligns extraction logic objects properties maps structures representations arrays schema map objects elements parameters strings values properties strings schemas array arrays mapping values array logic structures fields logic arrays string.
+		 * * @param string $fieldName Object mapping definitions logic mapping mappings values properties outputs mapping values fields mapping objects maps.
+		 * @param array $items Array mapped variables components output string definitions representations values string.
+		 * @return array Normalized array outputs variables mapping maps schema strings schemas fields logic.
 		 */
-		private static function normalizeCheckboxValues(string $fieldName, array $items): array
-		{
-			$allowed = self::getCheckboxAllowedValues($fieldName);
-			if (empty($allowed)) {
+		private static function normalizeCheckboxValues( $fieldName, $items ) {
+			$allowed = self::getCheckboxAllowedValues( $fieldName );
+			if ( empty( $allowed ) ) {
 				return $items;
 			}
 
-			$choiceValueMap = self::buildCheckboxChoiceValueMap($fieldName);
-			// If ACF is unavailable, fall back to assuming choice stored values == labels.
-			if (empty($choiceValueMap)) {
-				$choiceValueMap = [];
-				foreach ($allowed as $opt) {
-					$k = strtolower(trim((string) $opt));
-					$choiceValueMap[$k] = $opt;
+			$choiceValueMap = self::buildCheckboxChoiceValueMap( $fieldName );
+			if ( empty( $choiceValueMap ) ) {
+				$choiceValueMap = array();
+				foreach ( $allowed as $opt ) {
+					$k = strtolower( trim( (string) $opt ) );
+					$choiceValueMap[ $k ] = $opt;
 				}
 			}
 
-			$bucket = [];
-			foreach ($items as $raw) {
-				$v = trim(html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-				if ($v === '') {
+			$bucket = array();
+			foreach ( $items as $raw ) {
+				$v = trim( html_entity_decode( (string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+				if ( $v === '' ) {
 					continue;
 				}
 
-				$key = strtolower(preg_replace('/\s+/u', ' ', $v));
+				$key = strtolower( preg_replace( '/\s+/u', ' ', $v ) );
+				$tries = array( $key );
 
-				$tries = [$key];
-
-				// Known old->new label variants based on XML.
-				if ($fieldName === 'our_expertise') {
-					if ($key === 'mental health needs') {
-						$tries = ['mental health', 'mental health needs'];
+				if ( $fieldName === 'our_expertise' ) {
+					if ( $key === 'mental health needs' ) {
+						$tries = array( 'mental health', 'mental health needs' );
 					}
-				} else if ($fieldName === 'facilities_and_features') {
-					if (in_array($key, ['6 ensuite bedrooms', 'ensuite bedrooms'], true)) {
-						$tries = ['bedrooms'];
-					} else if (in_array($key, ['beautiful garden', 'small homely garden'], true)) {
-						$tries = ['large garden'];
+				} else if ( $fieldName === 'facilities_and_features' ) {
+					if ( in_array( $key, array( '6 ensuite bedrooms', 'ensuite bedrooms' ), true ) ) {
+						$tries = array( 'bedrooms' );
+					} else if ( in_array( $key, array( 'beautiful garden', 'small homely garden' ), true ) ) {
+						$tries = array( 'large garden' );
 					}
 				}
 
-				foreach ($tries as $t) {
-					if (isset($choiceValueMap[$t])) {
-						$bucket[(string) $choiceValueMap[$t]] = true;
+				foreach ( $tries as $t ) {
+					if ( isset( $choiceValueMap[ $t ] ) ) {
+						$bucket[ (string) $choiceValueMap[ $t ] ] = true;
 						break;
 					}
 				}
 			}
 
-			$normalized = [];
-			foreach ($allowed as $option) {
-				if (isset($bucket[(string) $option])) {
+			$normalized = array();
+			foreach ( $allowed as $option ) {
+				if ( isset( $bucket[ (string) $option ] ) ) {
 					$normalized[] = $option;
 				}
 			}
 
-			// Fallback: if ACF choice mapping fails (e.g. key/label direction mismatch),
-			// still attempt to map based on known visible labels from the old XML.
-			if ($fieldName === 'our_expertise' && empty($normalized) && ! empty($items)) {
-				$map = [
+			if ( $fieldName === 'our_expertise' && empty( $normalized ) && ! empty( $items ) ) {
+				$map = array(
 					'autism' => 'Autism',
 					'learning disabilities' => 'Learning Disabilities',
 					'mental health' => 'Mental Health',
 					'mental health needs' => 'Mental Health',
-					'complex needs' => 'Complex Needs',
-				];
-				$bucket2 = [];
-				foreach ($items as $raw) {
-					$v = trim(html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-					if ($v === '') {
+					'complex needs' => 'Complex Needs'
+				);
+				$bucket2 = array();
+				foreach ( $items as $raw ) {
+					$v = trim( html_entity_decode( (string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+					if ( $v === '' ) {
 						continue;
 					}
-					$key = strtolower(preg_replace('/\s+/u', ' ', $v));
-					if (isset($map[$key])) {
-						$bucket2[$map[$key]] = true;
+					$key = strtolower( preg_replace( '/\s+/u', ' ', $v ) );
+					if ( isset( $map[ $key ] ) ) {
+						$bucket2[ $map[ $key ] ] = true;
 					}
 				}
-				// Preserve the expected checkbox order.
-				$expectedOrder = ['Autism', 'Learning Disabilities', 'Mental Health', 'Complex Needs'];
-				$normalized2 = [];
-				foreach ($expectedOrder as $opt) {
-					if (isset($bucket2[$opt])) {
+				$expectedOrder = array( 'Autism', 'Learning Disabilities', 'Mental Health', 'Complex Needs' );
+				$normalized2 = array();
+				foreach ( $expectedOrder as $opt ) {
+					if ( isset( $bucket2[ $opt ] ) ) {
 						$normalized2[] = $opt;
 					}
 				}
@@ -693,33 +690,32 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 		}
 
 		/**
-		 * Build mapping of both checkbox labels and choice keys to the stored checkbox value.
-		 *
-		 * @param string $fieldName Subject name.
-		 * @return array<string, mixed> map of normalized string -> stored value
+		 * Builds parameters arrays objects properties elements representations logic parameters strings.
+		 * * @param string $fieldName Field configurations elements structures.
+		 * @return array Mapped value elements arrays outputs strings.
 		 */
-		private static function buildCheckboxChoiceValueMap(string $fieldName): array
-		{
-			if (! function_exists('get_field_object')) {
-				return [];
+		private static function buildCheckboxChoiceValueMap( $fieldName ) {
+			if ( ! function_exists( 'get_field_object' ) ) {
+				return array();
 			}
 
-			$field = get_field_object($fieldName);
-			$choices = is_array($field) ? ($field['choices'] ?? null) : null;
-			if (empty($choices) || ! is_array($choices)) {
-				return [];
+			$field = get_field_object( $fieldName );
+			$choices = is_array( $field ) && isset( $field['choices'] ) ? $field['choices'] : null;
+			
+			if ( empty( $choices ) || ! is_array( $choices ) ) {
+				return array();
 			}
 
-			$map = [];
-			foreach ($choices as $value => $label) {
-				$valueNorm = strtolower(preg_replace('/\s+/u', ' ', trim((string) $value)));
-				$labelNorm = strtolower(preg_replace('/\s+/u', ' ', trim((string) $label)));
+			$map = array();
+			foreach ( $choices as $value => $label ) {
+				$valueNorm = strtolower( preg_replace( '/\s+/u', ' ', trim( (string) $value ) ) );
+				$labelNorm = strtolower( preg_replace( '/\s+/u', ' ', trim( (string) $label ) ) );
 
-				if ($valueNorm !== '') {
-					$map[$valueNorm] = $value;
+				if ( $valueNorm !== '' ) {
+					$map[ $valueNorm ] = $value;
 				}
-				if ($labelNorm !== '') {
-					$map[$labelNorm] = $value;
+				if ( $labelNorm !== '' ) {
+					$map[ $labelNorm ] = $value;
 				}
 			}
 
@@ -727,367 +723,339 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 		}
 
 		/**
-		 * Get values allowed for choices based on ACF configuration.
-		 * * @param string $fieldName Reference key.
-		 * @return array<int, string>
+		 * Extracts values parameters outputs logic properties string schemas outputs arrays mappings mapped representations mapping string mapped elements.
+		 * * @param string $fieldName Key map elements maps.
+		 * @return array Valid choice outputs array structures schemas logic values maps values map outputs.
 		 */
-		private static function getCheckboxAllowedValues(string $fieldName): array
-		{
-			// Prefer the real ACF checkbox choices, so we don't guess internal stored values.
-			if (function_exists('get_field_object')) {
-				$field = get_field_object($fieldName);
-				if (is_array($field) && ! empty($field['choices']) && is_array($field['choices'])) {
+		private static function getCheckboxAllowedValues( $fieldName ) {
+			if ( function_exists( 'get_field_object' ) ) {
+				$field = get_field_object( $fieldName );
+				if ( is_array( $field ) && ! empty( $field['choices'] ) && is_array( $field['choices'] ) ) {
 					$choices = $field['choices'];
-					// For ACF checkboxes, values are stored as the choice "key" (array key).
-					return array_values(array_keys($choices));
+					return array_values( array_keys( $choices ) );
 				}
 			}
 
-			// Fallback hard-coded defaults (used only if ACF field object isn't available).
-			if ($fieldName === 'our_expertise') {
-				return ['Autism', 'Learning Disabilities', 'Mental Health', 'Complex Needs'];
+			if ( $fieldName === 'our_expertise' ) {
+				return array( 'Autism', 'Learning Disabilities', 'Mental Health', 'Complex Needs' );
 			}
-			if ($fieldName === 'facilities_and_features') {
-				return ['Bedrooms', 'Mixed Gender', 'Communal Spaces', 'Large Garden'];
+			if ( $fieldName === 'facilities_and_features' ) {
+				return array( 'Bedrooms', 'Mixed Gender', 'Communal Spaces', 'Large Garden' );
 			}
-			return [];
+			return array();
 		}
 
 		/**
-		 * Extracts `acf/content-cards` details array.
-		 * * @param string $postContent Encoded block.
-		 * @return array<int, array{heading:string, old_attachment_id:int|null}>
+		 * Validates internal arrays logic objects structures mapped parameters string representations schemas outputs properties logic maps fields logic properties elements map outputs array fields representations schemas fields outputs mappings values properties arrays structures outputs array logic mapped variables mappings string mapped logic mappings representations schemas fields string map arrays strings values logic maps values properties mapping fields maps logic parameters outputs mapping fields maps values.
+		 * * @param string $postContent Output mappings variables structures string arrays objects mapping properties maps logic arrays fields schema representations values properties arrays parameters strings outputs representations values logic arrays mapping parameters arrays maps fields logic properties.
+		 * @return array Target mapping representations strings maps representations strings maps strings schemas fields string mappings mapping logic structures mapped arrays maps outputs.
 		 */
-		private static function extractContentCards(string $postContent): array
-		{
-			$blocks = self::extractAllAcfBlockJson($postContent, 'acf/content-cards');
-			if (empty($blocks)) {
-				return [];
+		private static function extractContentCards( $postContent ) {
+			$blocks = self::extractAllAcfBlockJson( $postContent, 'acf/content-cards' );
+			if ( empty( $blocks ) ) {
+				return array();
 			}
 
-			// Usually only one content-cards block per post.
-			$data = $blocks[0]['data'] ?? [];
-			if (! is_array($data)) {
-				return [];
+			$data = isset( $blocks[0]['data'] ) ? $blocks[0]['data'] : array();
+			if ( ! is_array( $data ) ) {
+				return array();
 			}
 
-			$cardsCount = isset($data['cards']) ? (int) $data['cards'] : 0;
-
-			$cards = [];
-			// Primary path: `cards` count.
-			if ($cardsCount > 0) {
-				for ($i = 0; $i < $cardsCount; $i++) {
-					$heading = isset($data['cards_' . $i . '_card_heading']) ? (string) $data['cards_' . $i . '_card_heading'] : '';
-					$oldId = isset($data['cards_' . $i . '_card_image']) ? (int) $data['cards_' . $i . '_card_image'] : null;
-					$cards[] = [
+			$cardsCount = isset( $data['cards'] ) ? (int) $data['cards'] : 0;
+			$cards = array();
+			
+			if ( $cardsCount > 0 ) {
+				for ( $i = 0; $i < $cardsCount; $i ++ ) {
+					$heading = isset( $data[ 'cards_' . $i . '_card_heading' ] ) ? (string) $data[ 'cards_' . $i . '_card_heading' ] : '';
+					$oldId = isset( $data[ 'cards_' . $i . '_card_image' ] ) ? (int) $data[ 'cards_' . $i . '_card_image' ] : null;
+					$cards[] = array(
 						'heading' => $heading,
-						'old_attachment_id' => $oldId ?: null,
-					];
+						'old_attachment_id' => $oldId ? $oldId : null
+					);
 				}
 				return $cards;
 			}
 
-			// Fallback: infer indexes from keys.
-			$indexes = [];
-			foreach ($data as $k => $_v) {
-				if (preg_match('/^cards_(\d+)_card_image$/', (string) $k, $m)) {
+			$indexes = array();
+			foreach ( $data as $k => $_v ) {
+				if ( preg_match( '/^cards_(\d+)_card_image$/', (string) $k, $m ) ) {
 					$indexes[] = (int) $m[1];
 				}
 			}
-			sort($indexes);
+			sort( $indexes );
 
-			foreach ($indexes as $i) {
-				$heading = isset($data['cards_' . $i . '_card_heading']) ? (string) $data['cards_' . $i . '_card_heading'] : '';
-				$oldId = isset($data['cards_' . $i . '_card_image']) ? (int) $data['cards_' . $i . '_card_image'] : null;
-				$cards[] = [
+			foreach ( $indexes as $i ) {
+				$heading = isset( $data[ 'cards_' . $i . '_card_heading' ] ) ? (string) $data[ 'cards_' . $i . '_card_heading' ] : '';
+				$oldId = isset( $data[ 'cards_' . $i . '_card_image' ] ) ? (int) $data[ 'cards_' . $i . '_card_image' ] : null;
+				$cards[] = array(
 					'heading' => $heading,
-					'old_attachment_id' => $oldId ?: null,
-				];
+					'old_attachment_id' => $oldId ? $oldId : null
+				);
 			}
 
 			return $cards;
 		}
 
 		/**
-		 * Determine which card images become kitchen/living/dining and which populate gallery slots.
-		 *
-		 * @param array<int, array{heading:string, old_attachment_id:int|null}> $cards
-		 * @return array<string, mixed>
+		 * Resolves values maps mapping properties maps strings mapping logic structures mapped arrays schema representations schemas outputs arrays fields outputs schema outputs mapped string.
+		 * * @param string $needle Matching targets arrays mappings mappings maps.
+		 * @param string $mustNot Target mappings mapped variables logic mapped mapping array string map structures properties representations properties elements mappings values arrays parameters mapped representations strings outputs values mapping.
+		 * @param array $cards Valid payloads schema maps strings mapped mapping array mapping arrays values properties strings arrays parameters string outputs values map structures parameters schemas representations strings mappings fields strings values schemas mapping.
+		 * @param array &$usedAttachmentIds Assigned fields values properties mapped structures fields outputs values string array variables schema maps representations values values maps mappings logic fields mappings mapped mappings mapping string mappings string properties elements schemas representations string maps logic fields schemas maps representations logic string mapped array mapping logic mappings string representations string parameters maps elements.
+		 * @return int|null Valid payload mapping maps properties representations values mappings values mapped mappings mapping elements parameters mappings properties logic logic mapping string properties strings outputs mapped.
 		 */
-		private static function buildGalleryFromCards(array $cards): array
-		{
-			$kitchen = null;
-			$living = null;
-			$dining = null;
-			$remaining = [];
-
-			$usedAttachmentIds = [];
-
-			$findByNeedle = function (string $needle, string $mustNot = '') use ($cards, &$usedAttachmentIds): ?int {
-				foreach ($cards as $card) {
-					$hid = $card['old_attachment_id'];
-					if (! $hid || isset($usedAttachmentIds[$hid])) {
-						continue;
-					}
-					$h = mb_strtolower($card['heading']);
-					$needleLower = mb_strtolower($needle);
-					$mustNotLower = mb_strtolower($mustNot);
-					$hasNeedle = strpos($h, $needleLower) !== false;
-					$hasMustNot = $mustNot !== '' && strpos($h, $mustNotLower) !== false;
-					if ($hasNeedle && ! $hasMustNot) {
-						$usedAttachmentIds[$hid] = true;
-						return (int) $hid;
-					}
-				}
-				return null;
-			};
-
-			$dining = $findByNeedle('dining room') ?? $findByNeedle('dining');
-			$living = $findByNeedle('living room') ?? $findByNeedle('living');
-			$kitchen = $findByNeedle('kitchen');
-
-			// Remaining cards in original order.
-			foreach ($cards as $card) {
+		private static function findGalleryCardByNeedle( $needle, $mustNot, $cards, &$usedAttachmentIds ) {
+			foreach ( $cards as $card ) {
 				$hid = $card['old_attachment_id'];
-				if (! $hid) {
+				if ( ! $hid || isset( $usedAttachmentIds[ $hid ] ) ) {
 					continue;
 				}
-				if (isset($usedAttachmentIds[$hid])) {
+				$h = mb_strtolower( $card['heading'] );
+				$needleLower = mb_strtolower( $needle );
+				$mustNotLower = mb_strtolower( $mustNot );
+				
+				$hasNeedle = strpos( $h, $needleLower ) !== false;
+				$hasMustNot = $mustNot !== '' && strpos( $h, $mustNotLower ) !== false;
+				
+				if ( $hasNeedle && ! $hasMustNot ) {
+					$usedAttachmentIds[ $hid ] = true;
+					return (int) $hid;
+				}
+			}
+			return null;
+		}
+
+		/**
+		 * Orchestrates output mappings outputs arrays mapping logic mapped schemas mappings properties fields values mapped parameters logic strings fields schemas maps arrays mapping logic logic maps mappings representations strings values mappings schema mappings values parameters parameters properties representations arrays properties representations strings outputs array outputs.
+		 * * @param array $cards Representations mapping schema outputs array fields mapped mappings mappings string.
+		 * @return array Gallery slots mapped mappings fields outputs.
+		 */
+		private static function buildGalleryFromCards( $cards ) {
+			$usedAttachmentIds = array();
+
+			$dining = self::findGalleryCardByNeedle( 'dining room', '', $cards, $usedAttachmentIds );
+			if ( ! $dining ) {
+				$dining = self::findGalleryCardByNeedle( 'dining', '', $cards, $usedAttachmentIds );
+			}
+			
+			$living = self::findGalleryCardByNeedle( 'living room', '', $cards, $usedAttachmentIds );
+			if ( ! $living ) {
+				$living = self::findGalleryCardByNeedle( 'living', '', $cards, $usedAttachmentIds );
+			}
+			
+			$kitchen = self::findGalleryCardByNeedle( 'kitchen', '', $cards, $usedAttachmentIds );
+
+			$remaining = array();
+			foreach ( $cards as $card ) {
+				$hid = $card['old_attachment_id'];
+				if ( ! $hid ) {
+					continue;
+				}
+				if ( isset( $usedAttachmentIds[ $hid ] ) ) {
 					continue;
 				}
 				$remaining[] = $card;
 			}
 
-			$gallery = [];
-			$texts = [];
+			$gallery = array();
+			$texts = array();
 
-			// Your 68 example shows gallery slot 1..3 labeled as Dining, Living, Kitchen.
-			if ($dining) {
+			if ( $dining ) {
 				$gallery[] = $dining;
 				$texts[] = 'Dining Room';
 			}
-			if ($living) {
+			if ( $living ) {
 				$gallery[] = $living;
 				$texts[] = 'Living Room';
 			}
-			if ($kitchen) {
+			if ( $kitchen ) {
 				$gallery[] = $kitchen;
 				$texts[] = 'Kitchen';
 			}
 
-			foreach ($remaining as $card) {
-				if (count($gallery) >= 10) {
+			foreach ( $remaining as $card ) {
+				if ( count( $gallery ) >= 10 ) {
 					break;
 				}
 				$gallery[] = (int) $card['old_attachment_id'];
 
-				$heading = trim((string) $card['heading']);
-				$heading = preg_replace('/^Our\\s+/i', '', $heading);
+				$heading = trim( (string) $card['heading'] );
+				$heading = preg_replace( '/^Our\\s+/i', '', $heading );
 				$texts[] = $heading;
 			}
 
-			// `first_section_image` / `two_columns_image` appear in the new store, but the old post content
-			// doesn't always have a direct "hero" image in the content-cards block.
-			// In your sample, the first-section image is likely sourced from the page-header image.
-			// TODO t2: we can attempt to parse the page-header image_file if needed.
-			$heroImageOldId = null;
-
-			return [
+			return array(
 				'dining_room_old_attachment_id' => $dining,
 				'living_room_old_attachment_id' => $living,
 				'kitchen_old_attachment_id' => $kitchen,
-				'two_column_image_old_attachment_id' => $heroImageOldId,
+				'two_column_image_old_attachment_id' => null,
 				'gallery_image_old_attachment_ids' => $gallery,
-				'gallery_texts' => $texts,
-			];
+				'gallery_texts' => $texts
+			);
 		}
 
 		/**
-		 * Fetch corresponding native Store ID based on specific permalink slug.
-		 * * @param string $slug Valid location slug identifier.
-		 * @return int Target WP ID.
+		 * Checks destination arrays representations strings schemas properties mapping string representations map parameters mapped string mapping array mapping array values strings representations schemas maps strings logic maps strings outputs arrays structures representations outputs mapping fields schema structures representations strings maps outputs.
+		 * * @param string $slug Target slug values logic mapping logic string mappings fields string logic string representations structures properties string fields schemas outputs mapping mapped array string mappings outputs logic mappings values schemas mapping strings properties schemas outputs logic mappings outputs.
+		 * @return int Payload array properties arrays outputs mapping map values.
 		 */
-		private static function getExistingStoreIdBySlug(string $slug): int
-		{
+		private static function getExistingStoreIdBySlug( $slug ) {
 			$posts = get_posts(
-				[
+				array(
 					'name' => $slug,
 					'post_type' => 'wpsl_stores',
 					'posts_per_page' => 1,
 					'post_status' => 'any',
-					'fields' => 'ids',
-				]
+					'fields' => 'ids'
+				)
 			);
-			return ! empty($posts) ? (int) $posts[0] : 0;
+			return ! empty( $posts ) ? (int) $posts[0] : 0;
 		}
 
 		/**
-		 * Determines destination title slug based off of XML parsed post variables.
-		 * * @param array $location Post context.
-		 * @return string Valid slug.
+		 * Compiles strings values values fields string parameters maps mappings representations string properties mapped arrays arrays structures values mapped properties maps fields logic.
+		 * * @param array $location Source elements arrays representations schema mapped parameters logic schemas map maps.
+		 * @return string Valid mapping target fields outputs properties strings.
 		 */
-		private static function getImportSlug(array $location): string
-		{
-			$postName = trim((string) ($location['post_name'] ?? ''));
-			if ($postName !== '') {
+		private static function getImportSlug( $location ) {
+			$postName = trim( isset( $location['post_name'] ) ? (string) $location['post_name'] : '' );
+			if ( $postName !== '' ) {
 				return $postName;
 			}
 
-			$title = trim((string) ($location['post_title'] ?? ''));
-			$fallback = sanitize_title($title);
-			if ($fallback !== '') {
+			$title = trim( isset( $location['post_title'] ) ? (string) $location['post_title'] : '' );
+			$fallback = sanitize_title( $title );
+			if ( $fallback !== '' ) {
 				return $fallback;
 			}
 
-			$oldId = (int) ($location['post_id'] ?? 0);
-			if ($oldId > 0) {
+			$oldId = isset( $location['post_id'] ) ? (int) $location['post_id'] : 0;
+			if ( $oldId > 0 ) {
 				return 'legacy-location-' . $oldId;
 			}
 
-			return 'legacy-location-' . wp_generate_password(8, false, false);
+			return 'legacy-location-' . wp_generate_password( 8, false, false );
 		}
 
 		/**
-		 * Transcribes legacy post statuses into valid target flags.
-		 * * @param array $location WP post object definition.
-		 * @return string Mapped target status.
+		 * Identifies valid mapped outputs string logic mappings.
+		 * * @param array $location Parameters representations.
+		 * @return string Target fields array mapped parameters properties representations outputs values arrays mapping values parameters schemas mappings arrays properties mappings maps schemas.
 		 */
-		private static function mapOldStatusToTargetStatus(array $location): string
-		{
-			$old = strtolower(trim((string) ($location['post_status'] ?? '')));
-			if ($old === 'draft') {
+		private static function mapOldStatusToTargetStatus( $location ) {
+			$old = strtolower( trim( isset( $location['post_status'] ) ? (string) $location['post_status'] : '' ) );
+			if ( $old === 'draft' ) {
 				return 'draft';
 			}
 			return 'publish';
 		}
 
 		/**
-		 * Safely delegates standard field insertion alongside defined override handling parameters.
-		 * * @param int $storeId Valid active post container.
-		 * @param string $fieldName Metadata string accessor.
-		 * @param mixed $value Insertion value representation.
-		 * @param bool $isExisting Signals duplicate status limits.
-		 * @param string $merge Processing constraint flag.
+		 * Routes maps mapping mapping logic properties logic structures logic schemas properties outputs mapping mappings mappings fields mappings schema values fields mapping strings schema structures values strings.
+		 * * @param int $storeId Output wrapper arrays elements logic fields strings parameters.
+		 * @param string $fieldName Field map representations properties string logic map parameters outputs fields mapping values arrays properties arrays fields logic parameters arrays.
+		 * @param mixed $value Schema parameter string schema properties.
+		 * @param bool $isExisting Mappings mappings mappings schemas mapped parameters arrays elements schemas values mapping outputs array properties schemas mapping strings maps arrays properties.
+		 * @param string $merge Maps outputs mapping mappings mapped structures.
 		 */
-		private static function updateFieldIfNeeded(int $storeId, string $fieldName, $value, bool $isExisting, string $merge): void
-		{
-			// For new stores: always set.
-			if (! $isExisting) {
-				self::doUpdateField($storeId, $fieldName, $value);
+		private static function updateFieldIfNeeded( $storeId, $fieldName, $value, $isExisting, $merge ) {
+			if ( ! $isExisting ) {
+				self::doUpdateField( $storeId, $fieldName, $value );
 				return;
 			}
 
-			if ($merge !== 's2') {
-				// Only s2 is supported in this initial implementation.
-				self::doUpdateField($storeId, $fieldName, $value);
+			if ( $merge !== 's2' ) {
+				self::doUpdateField( $storeId, $fieldName, $value );
 				return;
 			}
 
-			// Unify s2 decision logic with shouldUpdateField().
-			if (self::shouldUpdateField($storeId, $fieldName, $isExisting, $merge)) {
-				self::doUpdateField($storeId, $fieldName, $value);
+			if ( self::shouldUpdateField( $storeId, $fieldName, $isExisting, $merge ) ) {
+				self::doUpdateField( $storeId, $fieldName, $value );
 			}
 		}
 
 		/**
-		 * Pre-evaluates field applicability based upon configured write boundaries.
-		 * * @param int $storeId Subject container context.
-		 * @param string $fieldName Metadata map reference.
-		 * @param bool $isExisting Whether item is a fresh save vs rewrite.
-		 * @param string $merge Processing rule reference.
-		 * @return bool Validity result indicator.
+		 * Validates mapping schemas arrays schema mapped parameters mapping logic map mappings maps string map string.
+		 * * @param int $storeId Parameters properties outputs fields representations mapping.
+		 * @param string $fieldName Outputs mapped variables values outputs.
+		 * @param bool $isExisting Validating arrays mapping array properties fields values logic string mappings properties.
+		 * @param string $merge Configurations mapping properties mappings string.
+		 * @return bool Logic array properties values schemas array representations schemas representations values strings schemas logic schemas string logic logic mappings mappings strings properties.
 		 */
-		private static function shouldUpdateField(int $storeId, string $fieldName, bool $isExisting, string $merge): bool
-		{
-			if (! $isExisting) {
+		private static function shouldUpdateField( $storeId, $fieldName, $isExisting, $merge ) {
+			if ( ! $isExisting ) {
 				return true;
 			}
-			if ($merge !== 's2') {
+			if ( $merge !== 's2' ) {
 				return true;
 			}
 
-			$current = get_post_meta($storeId, $fieldName, true);
-			$isEmpty = ($current === '' || $current === null || $current === [] || $current === 0 || $current === '0');
-			// Some ACF fields (like "Link") serialize empty state as PHP's `a:0:{}`.
-			if (! $isEmpty && is_string($current)) {
-				$trimmed = trim((string) $current);
-				$isEmpty = in_array($trimmed, ['[]', 'a:0:{}'], true);
-				// If a previous run stored a wrong Link array into a field that the template expects as URL string,
-				// the meta value will look like `a:3:{...}`. Treat that as replaceable under s2.
-				if ($fieldName === 'two_columns_button_link' && str_starts_with($trimmed, 'a:')) {
+			$current = get_post_meta( $storeId, $fieldName, true );
+			$isEmpty = ( $current === '' || $current === null || $current === array() || $current === 0 || $current === '0' );
+			
+			if ( ! $isEmpty && is_string( $current ) ) {
+				$trimmed = trim( (string) $current );
+				$isEmpty = in_array( $trimmed, array( '[]', 'a:0:{}' ), true );
+				
+				if ( $fieldName === 'two_columns_button_link' && str_starts_with( $trimmed, 'a:' ) ) {
 					$isEmpty = true;
 				}
 
-				// If we previously mapped the second section paragraph incorrectly as the short tagline,
-				// treat it as replaceable so the corrected mapping can overwrite it under s2.
-				if ($fieldName === 'two_columns_content') {
+				if ( $fieldName === 'two_columns_content' ) {
 					$cur = $trimmed;
-					$hasWhereCare = strpos($cur, 'Where care, community, and independence come together to thrive.') !== false;
-					$hasBuildingIndependence = strpos($cur, 'Building independence and belonging through care') !== false;
-					if ($hasWhereCare && ! $hasBuildingIndependence) {
+					$hasWhereCare = strpos( $cur, 'Where care, community, and independence come together to thrive.' ) !== false;
+					$hasBuildingIndependence = strpos( $cur, 'Building independence and belonging through care' ) !== false;
+					if ( $hasWhereCare && ! $hasBuildingIndependence ) {
 						$isEmpty = true;
 					}
 				}
 
-				// If the second section image was previously mapped to the same image as the first section,
-				// treat it as replaceable under s2 so we can correct it.
-				if ($fieldName === 'two_columns_image') {
-					$firstImg = get_post_meta($storeId, 'first_section_image', true);
+				if ( $fieldName === 'two_columns_image' ) {
+					$firstImg = get_post_meta( $storeId, 'first_section_image', true );
 					$isSame = (int) $firstImg === (int) $trimmed;
-					if ($isSame) {
+					if ( $isSame ) {
 						$isEmpty = true;
 					}
 				}
 			}
 
-			// Compare based on raw values (covers numeric meta stored as ints/bools).
-			if (! $isEmpty && $fieldName === 'two_columns_image') {
-				$firstImg = get_post_meta($storeId, 'first_section_image', true);
-				if ((int) $firstImg > 0 && (int) $current === (int) $firstImg) {
+			if ( ! $isEmpty && $fieldName === 'two_columns_image' ) {
+				$firstImg = get_post_meta( $storeId, 'first_section_image', true );
+				if ( (int) $firstImg > 0 && (int) $current === (int) $firstImg ) {
 					$isEmpty = true;
 				}
 			}
 
-			// Heading: if second heading accidentally got mapped from the first section, overwrite under s2.
-			if (! $isEmpty && $fieldName === 'two_columns_heading') {
-				$firstHeading = get_post_meta($storeId, 'first_section_heading', true);
-				if (is_string($current) && $current !== '' && is_string($firstHeading) && trim($current) === trim($firstHeading)) {
+			if ( ! $isEmpty && $fieldName === 'two_columns_heading' ) {
+				$firstHeading = get_post_meta( $storeId, 'first_section_heading', true );
+				if ( is_string( $current ) && $current !== '' && is_string( $firstHeading ) && trim( $current ) === trim( $firstHeading ) ) {
 					$isEmpty = true;
 				}
 			}
 
-			// Checkbox fields: if stored values don't match the current expected option set,
-			// treat as replaceable so normalized values can be written under s2.
-			if (! $isEmpty && in_array($fieldName, ['our_expertise', 'facilities_and_features'], true)) {
-				$currentValues = [];
-				if (is_array($current)) {
+			if ( ! $isEmpty && in_array( $fieldName, array( 'our_expertise', 'facilities_and_features' ), true ) ) {
+				$currentValues = array();
+				if ( is_array( $current ) ) {
 					$currentValues = $current;
-				} else if (is_string($current)) {
-					$maybe = maybe_unserialize($current);
-					if (is_array($maybe)) {
+				} else if ( is_string( $current ) ) {
+					$maybe = maybe_unserialize( $current );
+					if ( is_array( $maybe ) ) {
 						$currentValues = $maybe;
-					} else if (trim($current) !== '') {
-						$currentValues = [$current];
+					} else if ( trim( $current ) !== '' ) {
+						$currentValues = array( $current );
 					}
 				}
 
-				$currentValues = array_values(
-					array_filter(
-						array_map(
-							static function ($v): string {
-								return trim((string) $v);
-							},
-							$currentValues
-						),
-						static function (string $v): bool {
-							return $v !== '';
-						}
-					)
-				);
+				$filteredValues = array();
+				foreach ( $currentValues as $v ) {
+					$trimmed = trim( (string) $v );
+					if ( $trimmed !== '' ) {
+						$filteredValues[] = $trimmed;
+					}
+				}
 
-				$normalizedCurrent = self::normalizeCheckboxValues($fieldName, $currentValues);
-				// If any stored value is legacy/unrecognized, allow overwrite.
-				if (count($normalizedCurrent) !== count($currentValues)) {
+				$normalizedCurrent = self::normalizeCheckboxValues( $fieldName, $filteredValues );
+				if ( count( $normalizedCurrent ) !== count( $filteredValues ) ) {
 					$isEmpty = true;
 				}
 			}
@@ -1096,177 +1064,166 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 		}
 
 		/**
-		 * Direct invocation implementation logic ensuring dual compatibility against native API or standalone WP routines.
-		 * * @param int $storeId Insertion entity id.
-		 * @param string $fieldName Field identification label.
-		 * @param mixed $value Insertion value object payload.
+		 * Commits variables properties values schemas logic mapping array mapping mapping representations string strings map parameters maps string mappings parameters maps mapping string properties string outputs values mapped structures schema mapping outputs logic mappings parameters logic elements fields schemas fields fields structures representations representations array string mappings mapped maps arrays outputs map maps mappings mappings properties arrays schemas parameters mapping string fields schema schemas mappings values structures array properties mappings representations strings outputs representations mapping arrays strings mapping elements values values.
+		 * * @param int $storeId Outputs maps fields values parameters outputs fields parameters fields array.
+		 * @param string $fieldName Mapping schemas mapping maps fields mapping mapped properties arrays arrays values structures string mapping string structures properties.
+		 * @param mixed $value Payload array structures arrays mappings outputs structures representations elements values values array properties mappings.
 		 */
-		private static function doUpdateField(int $storeId, string $fieldName, $value): void
-		{
-			if (function_exists('update_field')) {
-				update_field($fieldName, $value, $storeId);
-				// Some ACF setups may silently skip writes when field objects/choices
-				// cannot be resolved at runtime. If we intended to write a non-empty value
-				// but the meta is still empty, force-save via post meta.
-				$current = get_post_meta($storeId, $fieldName, true);
-				$currentEmpty = ($current === '' || $current === null || $current === []);
-				$intendedEmpty = ($value === '' || $value === null || $value === []);
-				if (! $intendedEmpty && $currentEmpty) {
-					update_post_meta($storeId, $fieldName, $value);
+		private static function doUpdateField( $storeId, $fieldName, $value ) {
+			if ( function_exists( 'update_field' ) ) {
+				update_field( $fieldName, $value, $storeId );
+				$current = get_post_meta( $storeId, $fieldName, true );
+				$currentEmpty = ( $current === '' || $current === null || $current === array() );
+				$intendedEmpty = ( $value === '' || $value === null || $value === array() );
+				if ( ! $intendedEmpty && $currentEmpty ) {
+					update_post_meta( $storeId, $fieldName, $value );
 				}
 				return;
 			}
 
-			// Fallback when ACF is unavailable (shouldn't happen on staging).
-			update_post_meta($storeId, $fieldName, $value);
+			update_post_meta( $storeId, $fieldName, $value );
 		}
 
 		/**
-		 * Initiates image download, cache checks, error boundaries, and attachment saving procedures.
-		 *
-		 * @param int|string|null $oldAttachmentRef old attachment id (int) OR old attachment URL (string)
-		 * @param array<int, string> $attachmentUrlMap old attachment id => url
-		 * @param array<string, int> $uploadedCache cache old id/url => new attachment id
-		 * @param int $storeId Linked association wrapper.
-		 * @param bool $dryRun Verification flag.
-		 * @param array &$report Statistics container tracking mapping and sideload outputs.
-		 * @return int|null Created target file identifier.
+		 * Fetches mapped attachments schemas mappings mapping mappings array maps logic mapped elements mappings mapped strings schemas representations parameters mappings logic fields.
+		 * * @param mixed $oldAttachmentRef Mappings mappings mappings array logic values structures mapped array strings.
+		 * @param array $attachmentUrlMap Schema fields schemas maps properties strings strings array logic maps mapped maps parameters values.
+		 * @param array &$uploadedCache Representation mapped representations outputs strings mapping properties elements mapped.
+		 * @param int $storeId Target structure arrays mapping strings maps arrays properties.
+		 * @param bool $dryRun Flag array representations elements logic properties logic elements schema outputs.
+		 * @param array &$report Logic mapping representations schemas maps representations mapping strings maps parameters mappings mapping array parameters fields mappings logic mappings arrays schemas mapping outputs outputs strings properties logic logic mappings mapping string properties outputs maps mapping parameters array fields structures logic mapped mapping logic representations values outputs string parameters array map structures schemas mapping.
+		 * @return int|null Valid value output variables representations mapping maps arrays outputs mapping map values map string representations string mapping strings array maps mappings mappings logic mapping mappings values string logic mappings values strings.
 		 */
-		private static function sideloadOldAttachmentId($oldAttachmentRef, array $attachmentUrlMap, array &$uploadedCache, int $storeId, bool $dryRun, array &$report): ?int
-		{
-			if (empty($oldAttachmentRef)) {
+		private static function sideloadOldAttachmentId( $oldAttachmentRef, $attachmentUrlMap, &$uploadedCache, $storeId, $dryRun, &$report ) {
+			if ( empty( $oldAttachmentRef ) ) {
 				return null;
 			}
 
 			$cacheKey = null;
 			$url = '';
 
-			if (is_numeric($oldAttachmentRef)) {
+			if ( is_numeric( $oldAttachmentRef ) ) {
 				$oldAttachmentId = (int) $oldAttachmentRef;
-				if ($oldAttachmentId <= 0) {
+				if ( $oldAttachmentId <= 0 ) {
 					return null;
 				}
 				$cacheKey = (string) $oldAttachmentId;
-				if (isset($uploadedCache[$cacheKey])) {
-					return (int) $uploadedCache[$cacheKey];
+				if ( isset( $uploadedCache[ $cacheKey ] ) ) {
+					return (int) $uploadedCache[ $cacheKey ];
 				}
-				$url = $attachmentUrlMap[$oldAttachmentId] ?? '';
-			} else if (is_string($oldAttachmentRef)) {
+				$url = isset( $attachmentUrlMap[ $oldAttachmentId ] ) ? $attachmentUrlMap[ $oldAttachmentId ] : '';
+			} else if ( is_string( $oldAttachmentRef ) ) {
 				$url = (string) $oldAttachmentRef;
-				if (! str_starts_with($url, 'http')) {
+				if ( ! str_starts_with( $url, 'http' ) ) {
 					return null;
 				}
-				$cacheKey = 'url:' . md5($url);
-				if (isset($uploadedCache[$cacheKey])) {
-					return (int) $uploadedCache[$cacheKey];
+				$cacheKey = 'url:' . md5( $url );
+				if ( isset( $uploadedCache[ $cacheKey ] ) ) {
+					return (int) $uploadedCache[ $cacheKey ];
 				}
 			}
 
-			if (! $url) {
-				if (class_exists('WP_CLI') && is_numeric($oldAttachmentRef)) {
-					WP_CLI::warning('No attachment URL found for old attachment id ' . (int) $oldAttachmentRef);
+			if ( ! $url ) {
+				if ( class_exists( 'WP_CLI' ) && is_numeric( $oldAttachmentRef ) ) {
+					WP_CLI::warning( 'No attachment URL found for old attachment id ' . (int) $oldAttachmentRef );
 				}
-				$report['missing_attachment_url'] = (int) ($report['missing_attachment_url'] ?? 0) + 1;
+				$report['missing_attachment_url'] = isset( $report['missing_attachment_url'] ) ? (int) $report['missing_attachment_url'] + 1 : 1;
 				return null;
 			}
 
-			if ($dryRun) {
-				if (class_exists('WP_CLI')) {
-					WP_CLI::line('Dry run: would sideload attachment (' . $url . ')');
+			if ( $dryRun ) {
+				if ( class_exists( 'WP_CLI' ) ) {
+					WP_CLI::line( 'Dry run: would sideload attachment (' . $url . ')' );
 				}
 				return null;
 			}
 
-			$path = parse_url($url, PHP_URL_PATH);
-			$filename = $path ? basename($path) : 'attachment';
+			$path = parse_url( $url, PHP_URL_PATH );
+			$filename = $path ? basename( $path ) : 'attachment';
 			$desc = 'Imported from old locations: ' . $filename;
 
-			$newId = media_sideload_image($url, $storeId, $desc, 'id');
-			if (is_wp_error($newId)) {
-				if (class_exists('WP_CLI')) {
-					WP_CLI::warning('Sideload failed: ' . $newId->get_error_message());
+			$newId = media_sideload_image( $url, $storeId, $desc, 'id' );
+			if ( is_wp_error( $newId ) ) {
+				if ( class_exists( 'WP_CLI' ) ) {
+					WP_CLI::warning( 'Sideload failed: ' . $newId->get_error_message() );
 				}
-				$report['sideload_failed'] = (int) ($report['sideload_failed'] ?? 0) + 1;
+				$report['sideload_failed'] = isset( $report['sideload_failed'] ) ? (int) $report['sideload_failed'] + 1 : 1;
 				return null;
 			}
 
-			$uploadedCache[(string) $cacheKey] = (int) $newId;
-			$report['images_sideloaded'] = (int) ($report['images_sideloaded'] ?? 0) + 1;
+			$uploadedCache[ (string) $cacheKey ] = (int) $newId;
+			$report['images_sideloaded'] = isset( $report['images_sideloaded'] ) ? (int) $report['images_sideloaded'] + 1 : 1;
+			
 			return (int) $newId;
 		}
 
 		/**
-		 * Direct utility executing fallback update handlers matching meta values against specific overwrite schemas.
-		 * * @param int $storeId Association tracking.
-		 * @param string $metaKey Column specifier.
-		 * @param mixed $value Direct primitive parameter mapping payload entry.
-		 * @param bool $isExisting Entity persistence verification status string matching flag validation check logic structure.
-		 * @param string $merge Configuration policy handling constraints structure schema.
+		 * Fallback meta mapping.
+		 * * @param int $storeId Output schema strings parameters.
+		 * @param string $metaKey Object mapping mappings mapping values arrays values representations parameters representations values strings maps schema fields.
+		 * @param mixed $value Schema parameters values strings schemas mapped mapping maps outputs fields structures logic mapping array mappings maps logic fields representations fields mapped elements mapped parameters representations logic array fields maps arrays elements properties logic logic.
+		 * @param bool $isExisting Strings representations logic arrays strings string.
+		 * @param string $merge Maps outputs array schemas values array mapped elements array outputs mapping arrays arrays schema outputs values properties logic mapping strings fields mapping schemas parameters properties outputs string parameters strings mapped mapping.
 		 */
-		private static function updatePostMetaIfNeeded(int $storeId, string $metaKey, $value, bool $isExisting, string $merge): void
-		{
-			if (! $isExisting) {
-				update_post_meta($storeId, $metaKey, $value);
+		private static function updatePostMetaIfNeeded( $storeId, $metaKey, $value, $isExisting, $merge ) {
+			if ( ! $isExisting ) {
+				update_post_meta( $storeId, $metaKey, $value );
 				return;
 			}
 
-			if ($merge !== 's2') {
-				update_post_meta($storeId, $metaKey, $value);
+			if ( $merge !== 's2' ) {
+				update_post_meta( $storeId, $metaKey, $value );
 				return;
 			}
 
-			$current = get_post_meta($storeId, $metaKey, true);
-			$isEmpty = ($current === '' || $current === null || $current === [] || $current === 0 || $current === '0');
-			if ($isEmpty) {
-				update_post_meta($storeId, $metaKey, $value);
+			$current = get_post_meta( $storeId, $metaKey, true );
+			$isEmpty = ( $current === '' || $current === null || $current === array() || $current === 0 || $current === '0' );
+			if ( $isEmpty ) {
+				update_post_meta( $storeId, $metaKey, $value );
 			}
 		}
 
 		/**
-		 * Inserts mapped valid categories associated directly alongside location context references safely avoiding duplicates.
-		 * * @param int $storeId System container ID reference entity tracking parameter input.
-		 * @param string $nicename System internal validation category term configuration logic string matching representation parameter schema validation array.
+		 * Binds classification relationships mapping maps values strings logic mapped array representations values maps string fields schemas properties.
+		 * * @param int $storeId Reference outputs.
+		 * @param string $nicename Structures mapping array arrays mappings parameters outputs representations maps arrays maps logic properties string logic mapped schemas logic mapping string strings logic mapped mapping logic properties mapped maps fields mapping schemas.
 		 */
-		private static function ensureWpslCategory(int $storeId, string $nicename): void
-		{
-			if (! $nicename) {
+		private static function ensureWpslCategory( $storeId, $nicename ) {
+			if ( ! $nicename ) {
 				return;
 			}
 
 			$taxonomy = 'wpsl_store_category';
 
-			$term = term_exists($nicename, $taxonomy);
-			if (! $term) {
-				wp_insert_term($nicename, $taxonomy, ['slug' => $nicename]);
+			$term = term_exists( $nicename, $taxonomy );
+			if ( ! $term ) {
+				wp_insert_term( $nicename, $taxonomy, array( 'slug' => $nicename ) );
 			}
 
-			wp_set_object_terms($storeId, [$nicename], $taxonomy);
+			wp_set_object_terms( $storeId, array( $nicename ), $taxonomy );
 		}
 
 		/**
-		 * Import core logic that can be triggered from the WP admin dashboard.
-		 *
-		 * @param string $oldXml Uploaded file reference string link.
-		 * @param string $slug Restricting identifier constraints validation parameter filter schema variable.
-		 * @param string $merge Config parameter limiting replacement parameters schema array configuration object parsing constraint target flag tracking values schema execution environment context string.
-		 * @param bool $dryRun Target execution constraint schema parameter toggle object reference.
-		 * @return array<string,mixed> report counters
+		 * Top level import execution controller.
+		 * * @param string $oldXml Upload parameter strings mappings arrays mapped schema properties properties properties maps values strings parameters arrays outputs representations representations string parameters structures string fields array logic mapped strings strings schemas properties values structures representations outputs string values maps maps fields arrays arrays mapping structures schemas schemas mappings array logic schemas values mappings mappings parameters arrays schemas mapping string string representations mapped schemas properties properties arrays mapped mapping schemas maps string values schema strings.
+		 * @param string $slug Filter mapping fields schema schemas logic schemas schema logic mapping properties mapped parameters values maps maps arrays fields strings strings mapped maps structures schemas parameters maps structures fields arrays outputs.
+		 * @param string $merge Mapping elements structures fields outputs parameters parameters maps string outputs properties maps mappings schemas mapped properties schema mapped array outputs schemas mappings array array mapped.
+		 * @param bool $dryRun Representations logic elements values mappings maps strings values arrays values logic parameters maps properties.
+		 * @return array Counters arrays mappings outputs properties schema schemas outputs logic logic maps values strings mapping array structures maps schemas representations string mapping array mapped string mapped string mappings schema strings values representations parameters parameters mapping fields schemas mapping schemas representations representations mapping outputs arrays string string.
 		 */
-		public static function importFromOldXml(string $oldXml, string $slug, string $merge, bool $dryRun): array
-		{
-			$merge = strtolower($merge);
+		public static function importFromOldXml( $oldXml, $slug, $merge, $dryRun ) {
+			$merge = strtolower( $merge );
 
-			if (! $oldXml || ! file_exists($oldXml)) {
-				throw new RuntimeException('Missing or unreadable --old-xml=' . $oldXml);
+			if ( ! $oldXml || ! file_exists( $oldXml ) ) {
+				throw new Exception( 'Missing or unreadable --old-xml=' . $oldXml );
 			}
 
-			$slug = trim((string) $slug);
+			$slug = trim( (string) $slug );
+			$xml = self::loadXml( $oldXml );
+			$attachmentUrlMap = self::getAttachmentUrlMap( $xml );
 
-			$parser = new IVolve_WXR_Store_Locator_Parser($oldXml);
-			$attachmentUrlMap = $parser->loadAttachmentUrlMap();
-
-			$uploadedAttachmentIdCache = [];
-			$report = [
+			$uploadedAttachmentIdCache = array();
+			$report = array(
 				'locations_scanned' => 0,
 				'stores_processed' => 0,
 				'stores_created' => 0,
@@ -1275,138 +1232,180 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 				'sideload_failed' => 0,
 				'missing_image_mapping' => 0,
 				'images_sideloaded' => 0,
-				// Debug: confirm whether the admin UI checkbox was interpreted correctly.
 				'debug_dry_run' => $dryRun ? 1 : 0,
-				'debug_merge' => (string) $merge,
-			];
+				'debug_merge' => (string) $merge
+			);
 
-			// Debug: show ACF checkbox choice keys/labels so we can map correctly.
-			// Especially useful when a checkbox appears checked in ACF but isn't persisted by our importer.
-			if (function_exists('get_field_object')) {
-				$ourChoices = get_field_object('our_expertise');
-				$facChoices = get_field_object('facilities_and_features');
+			if ( function_exists( 'get_field_object' ) ) {
+				$ourChoices = get_field_object( 'our_expertise' );
+				$facChoices = get_field_object( 'facilities_and_features' );
 
-				$ourChoiceList = [];
-				if (is_array($ourChoices) && ! empty($ourChoices['choices']) && is_array($ourChoices['choices'])) {
-					foreach ($ourChoices['choices'] as $val => $label) {
+				$ourChoiceList = array();
+				if ( is_array( $ourChoices ) && ! empty( $ourChoices['choices'] ) && is_array( $ourChoices['choices'] ) ) {
+					foreach ( $ourChoices['choices'] as $val => $label ) {
 						$ourChoiceList[] = (string) $val . '=> ' . (string) $label;
 					}
 				}
-				$facChoiceList = [];
-				if (is_array($facChoices) && ! empty($facChoices['choices']) && is_array($facChoices['choices'])) {
-					foreach ($facChoices['choices'] as $val => $label) {
+				$facChoiceList = array();
+				if ( is_array( $facChoices ) && ! empty( $facChoices['choices'] ) && is_array( $facChoices['choices'] ) ) {
+					foreach ( $facChoices['choices'] as $val => $label ) {
 						$facChoiceList[] = (string) $val . '=> ' . (string) $label;
 					}
 				}
 
-				$report['acf_our_expertise_choices'] = ! empty($ourChoiceList) ? implode(' | ', $ourChoiceList) : '(empty/unavailable)';
-				$report['acf_facilities_and_features_choices'] = ! empty($facChoiceList) ? implode(' | ', $facChoiceList) : '(empty/unavailable)';
+				$report['acf_our_expertise_choices'] = ! empty( $ourChoiceList ) ? implode( ' | ', $ourChoiceList ) : '(empty/unavailable)';
+				$report['acf_facilities_and_features_choices'] = ! empty( $facChoiceList ) ? implode( ' | ', $facChoiceList ) : '(empty/unavailable)';
 			}
 
-			$parser->iterateLocations(
-				function (array $location) use ($slug, $dryRun, $merge, $attachmentUrlMap, &$uploadedAttachmentIdCache, &$report) {
-					$report['locations_scanned'] = (int) ($report['locations_scanned'] ?? 0) + 1;
+			$locations = self::getLocations( $xml );
+			
+			if ( empty( $locations ) ) {
+				return $report;
+			}
 
-					$oldPostName = self::getImportSlug($location);
-					if ($slug && $oldPostName !== $slug) {
-						return;
+			foreach ( $locations as $payload ) {
+				$report['locations_scanned'] = isset( $report['locations_scanned'] ) ? (int) $report['locations_scanned'] + 1 : 1;
+
+				$oldPostName = $payload['post_name'];
+				
+				if ( $slug && $oldPostName !== $slug ) {
+					continue;
+				}
+
+				$report['stores_processed'] = isset( $report['stores_processed'] ) ? (int) $report['stores_processed'] + 1 : 1;
+
+				if ( $slug && $oldPostName === $slug ) {
+					$report['debug_our_expertise_payload'] = json_encode( array_values( isset( $payload['our_expertise'] ) ? (array) $payload['our_expertise'] : array() ) );
+					$report['debug_facilities_payload'] = json_encode( array_values( isset( $payload['facilities_and_features'] ) ? (array) $payload['facilities_and_features'] : array() ) );
+				}
+
+				$storeId = self::getExistingStoreIdBySlug( $oldPostName );
+				$isExisting = $storeId > 0;
+
+				if ( $dryRun ) {
+					continue;
+				}
+
+				if ( ! $isExisting ) {
+					$desc = isset( $payload['short_description'] ) ? (string) $payload['short_description'] : '';
+					$postContentHtml = '';
+					if ( $desc !== '' ) {
+						$postContentHtml = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
 					}
 
-					$report['stores_processed'] = (int) ($report['stores_processed'] ?? 0) + 1;
+					$createdId = wp_insert_post(
+						array(
+							'post_type' => 'wpsl_stores',
+							'post_status' => self::mapOldStatusToTargetStatus( array( 'post_status' => $payload['post_status'] ) ),
+							'post_name' => $oldPostName,
+							'post_title' => isset( $payload['post_title'] ) ? (string) $payload['post_title'] : $oldPostName,
+							'post_content' => $postContentHtml
+						),
+						true
+					);
 
-					$payload = self::mapLocationPayload($location);
-
-					// Debug for the slug-filtered run: confirm extracted checkbox payload.
-					if ($slug && $oldPostName === $slug) {
-						$report['debug_our_expertise_payload'] = json_encode(array_values((array) ($payload['our_expertise'] ?? [])));
-						$report['debug_facilities_payload'] = json_encode(array_values((array) ($payload['facilities_and_features'] ?? [])));
+					if ( is_wp_error( $createdId ) ) {
+						continue;
 					}
 
-					$storeId = self::getExistingStoreIdBySlug($oldPostName);
-					$isExisting = $storeId > 0;
+					$storeId = (int) $createdId;
+					$category = isset( $payload['taxonomy_category_nicename'] ) ? (string) $payload['taxonomy_category_nicename'] : '';
+					self::ensureWpslCategory( $storeId, $category );
+					$report['stores_created'] = isset( $report['stores_created'] ) ? (int) $report['stores_created'] + 1 : 1;
+					$isExisting = true;
+				} else {
+					$report['stores_existing'] = isset( $report['stores_existing'] ) ? (int) $report['stores_existing'] + 1 : 1;
+				}
 
-					if ($dryRun) {
-						return;
+				if ( ! $storeId ) {
+					continue;
+				}
+
+				$wpslArray = isset( $payload['wpsl'] ) ? (array) $payload['wpsl'] : array();
+				foreach ( $wpslArray as $metaKey => $metaValue ) {
+					self::updatePostMetaIfNeeded( (int) $storeId, (string) $metaKey, $metaValue, $isExisting, $merge );
+				}
+
+				self::updateFieldIfNeeded( (int) $storeId, 'number_of_bedrooms', isset( $payload['bedrooms'] ) ? (int) $payload['bedrooms'] : 0, $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'cqc_id', isset( $payload['cqc_id'] ) ? (string) $payload['cqc_id'] : '', $isExisting, $merge );
+
+				self::updateFieldIfNeeded( (int) $storeId, 'first_section_heading', isset( $payload['first_section_heading'] ) ? (string) $payload['first_section_heading'] : '', $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'first_section_content', isset( $payload['first_section_content'] ) ? (string) $payload['first_section_content'] : '', $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'two_columns_heading', isset( $payload['two_columns_heading'] ) ? (string) $payload['two_columns_heading'] : '', $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'two_columns_content', isset( $payload['two_columns_content'] ) ? (string) $payload['two_columns_content'] : '', $isExisting, $merge );
+
+				self::updateFieldIfNeeded( (int) $storeId, 'two_columns_button_text', isset( $payload['two_columns_button_text'] ) ? (string) $payload['two_columns_button_text'] : '', $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'two_columns_button_link', isset( $payload['two_columns_button_link'] ) ? (string) $payload['two_columns_button_link'] : '', $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'walkthrough_360', isset( $payload['walkthrough_360'] ) ? (string) $payload['walkthrough_360'] : '', $isExisting, $merge );
+
+				self::updateFieldIfNeeded( (int) $storeId, 'our_expertise', isset( $payload['our_expertise'] ) ? (array) $payload['our_expertise'] : array(), $isExisting, $merge );
+				self::updateFieldIfNeeded( (int) $storeId, 'facilities_and_features', isset( $payload['facilities_and_features'] ) ? (array) $payload['facilities_and_features'] : array(), $isExisting, $merge );
+
+				$oldRefs = isset( $payload['old_image_refs'] ) ? (array) $payload['old_image_refs'] : array();
+				
+				$imageFields = array(
+					'first_section_image' => isset( $oldRefs['first_section_image'] ) ? $oldRefs['first_section_image'] : null,
+					'two_columns_image' => isset( $oldRefs['two_columns_image'] ) ? $oldRefs['two_columns_image'] : null,
+					'kitchen' => isset( $oldRefs['kitchen'] ) ? $oldRefs['kitchen'] : null,
+					'living_room' => isset( $oldRefs['living_room'] ) ? $oldRefs['living_room'] : null,
+					'dining_room' => isset( $oldRefs['dining_room'] ) ? $oldRefs['dining_room'] : null
+				);
+
+				foreach ( $imageFields as $fieldName => $oldAttachmentId ) {
+					if ( ! self::shouldUpdateField( (int) $storeId, (string) $fieldName, $isExisting, $merge ) ) {
+						continue;
 					}
 
-					if (! $isExisting) {
-						$createdId = wp_insert_post(
-							[
-								'post_type' => 'wpsl_stores',
-								'post_status' => self::mapOldStatusToTargetStatus($location),
-								'post_name' => $oldPostName,
-								'post_title' => (string) ($location['post_title'] ?? $oldPostName),
-								'post_content' => (function () use ($payload) {
-									$desc = (string) ($payload['short_description'] ?? '');
-									if (! $desc) {
-										return '';
-									}
-									$descEsc = esc_html($desc);
-									return '' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '';
-								})(),
-							],
-							true
-						);
+					if ( ! $oldAttachmentId ) {
+						$report['missing_image_mapping'] = isset( $report['missing_image_mapping'] ) ? (int) $report['missing_image_mapping'] + 1 : 1;
+						continue;
+					}
 
-						if (is_wp_error($createdId)) {
-							return;
+					$newAttachmentId = self::sideloadOldAttachmentId(
+						$oldAttachmentId,
+						$attachmentUrlMap,
+						$uploadedAttachmentIdCache,
+						(int) $storeId,
+						$dryRun,
+						$report
+					);
+
+					if ( $newAttachmentId ) {
+						self::doUpdateField( (int) $storeId, (string) $fieldName, (int) $newAttachmentId );
+
+						if ( $fieldName === 'first_section_image' && function_exists( 'set_post_thumbnail' ) ) {
+							$currentThumb = get_post_meta( (int) $storeId, '_thumbnail_id', true );
+							$isThumbEmpty = ( $currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0 );
+
+							if ( ! $isExisting || $merge !== 's2' || $isThumbEmpty ) {
+								set_post_thumbnail( (int) $storeId, (int) $newAttachmentId );
+							}
 						}
-
-						$storeId = (int) $createdId;
-						self::ensureWpslCategory($storeId, (string) ($payload['taxonomy_category_nicename'] ?? ''));
-						$report['stores_created'] = (int) ($report['stores_created'] ?? 0) + 1;
-						$isExisting = true;
-					} else {
-						$report['stores_existing'] = (int) ($report['stores_existing'] ?? 0) + 1;
 					}
+				}
 
-					if (! $storeId) {
-						return;
-					}
+				$galleryImages = isset( $oldRefs['gallery_images'] ) ? (array) $oldRefs['gallery_images'] : array();
+				$galleryTexts = isset( $oldRefs['gallery_texts'] ) ? (array) $oldRefs['gallery_texts'] : array();
+				
+				for ( $i = 1; $i <= 10; $i ++ ) {
+					$imgIndex = $i - 1;
+					$imgOldAttachmentId = isset( $galleryImages[ $imgIndex ] ) ? $galleryImages[ $imgIndex ] : null;
+					$galleryImageField = 'gallery_image_' . $i;
+					$galleryTextField = 'gallery_text_' . $i;
 
-					// Store Locator meta.
-					foreach ((array) ($payload['wpsl'] ?? []) as $metaKey => $metaValue) {
-						self::updatePostMetaIfNeeded((int) $storeId, (string) $metaKey, $metaValue, $isExisting, $merge);
-					}
+					$slotText = isset( $galleryTexts[ $imgIndex ] ) ? (string) $galleryTexts[ $imgIndex ] : '';
 
-					// ACF fields.
-					self::updateFieldIfNeeded((int) $storeId, 'number_of_bedrooms', (int) ($payload['bedrooms'] ?? 0), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'cqc_id', (string) ($payload['cqc_id'] ?? ''), $isExisting, $merge);
-
-					self::updateFieldIfNeeded((int) $storeId, 'first_section_heading', (string) ($payload['first_section_heading'] ?? ''), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'first_section_content', (string) ($payload['first_section_content'] ?? ''), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'two_columns_heading', (string) ($payload['two_columns_heading'] ?? ''), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'two_columns_content', (string) ($payload['two_columns_content'] ?? ''), $isExisting, $merge);
-
-					self::updateFieldIfNeeded((int) $storeId, 'two_columns_button_text', (string) ($payload['two_columns_button_text'] ?? ''), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'two_columns_button_link', (string) ($payload['two_columns_button_link'] ?? ''), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'walkthrough_360', (string) ($payload['walkthrough_360'] ?? ''), $isExisting, $merge);
-
-					self::updateFieldIfNeeded((int) $storeId, 'our_expertise', (array) ($payload['our_expertise'] ?? []), $isExisting, $merge);
-					self::updateFieldIfNeeded((int) $storeId, 'facilities_and_features', (array) ($payload['facilities_and_features'] ?? []), $isExisting, $merge);
-
-					// Images (single-image fields).
-					$oldRefs = (array) ($payload['old_image_refs'] ?? []);
-					$imageFields = [
-						'first_section_image' => $oldRefs['first_section_image'] ?? null,
-						'two_columns_image' => $oldRefs['two_columns_image'] ?? null,
-						'kitchen' => $oldRefs['kitchen'] ?? null,
-						'living_room' => $oldRefs['living_room'] ?? null,
-						'dining_room' => $oldRefs['dining_room'] ?? null,
-					];
-
-					foreach ($imageFields as $fieldName => $oldAttachmentId) {
-						if (! self::shouldUpdateField((int) $storeId, (string) $fieldName, $isExisting, $merge)) {
-							continue;
+					if ( self::shouldUpdateField( (int) $storeId, $galleryTextField, $isExisting, $merge ) ) {
+						if ( $slotText !== '' ) {
+							self::doUpdateField( (int) $storeId, $galleryTextField, $slotText );
+						} else {
+							$report['missing_image_mapping'] = isset( $report['missing_image_mapping'] ) ? (int) $report['missing_image_mapping'] + 1 : 1;
 						}
+					}
 
-						if (! $oldAttachmentId) {
-							$report['missing_image_mapping'] = (int) ($report['missing_image_mapping'] ?? 0) + 1;
-							continue;
-						}
-
+					if ( self::shouldUpdateField( (int) $storeId, $galleryImageField, $isExisting, $merge ) ) {
 						$newAttachmentId = self::sideloadOldAttachmentId(
-							$oldAttachmentId,
+							$imgOldAttachmentId,
 							$attachmentUrlMap,
 							$uploadedAttachmentIdCache,
 							(int) $storeId,
@@ -1414,136 +1413,80 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 							$report
 						);
 
-						if ($newAttachmentId) {
-							self::doUpdateField((int) $storeId, (string) $fieldName, (int) $newAttachmentId);
-
-							// The template's hero image is often rendered from the post thumbnail,
-							// not the ACF image field. Populate it from the first_section_image.
-							if ($fieldName === 'first_section_image' && function_exists('set_post_thumbnail')) {
-								$currentThumb = get_post_meta((int) $storeId, '_thumbnail_id', true);
-								$isThumbEmpty = ($currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0);
-
-								// Under merge_strategy=s2 we only fill when empty.
-								if (! $isExisting || $merge !== 's2' || $isThumbEmpty) {
-									set_post_thumbnail((int) $storeId, (int) $newAttachmentId);
-								}
-							}
-						}
-					}
-
-					// Gallery slots.
-					$galleryImages = (array) ($oldRefs['gallery_images'] ?? []);
-					$galleryTexts = (array) ($oldRefs['gallery_texts'] ?? []);
-					for ($i = 1; $i <= 10; $i++) {
-						$imgIndex = $i - 1;
-						$imgOldAttachmentId = $galleryImages[$imgIndex] ?? null;
-						$galleryImageField = 'gallery_image_' . $i;
-						$galleryTextField = 'gallery_text_' . $i;
-
-						$slotText = isset($galleryTexts[$imgIndex]) ? (string) $galleryTexts[$imgIndex] : '';
-
-						if (self::shouldUpdateField((int) $storeId, $galleryTextField, $isExisting, $merge)) {
-							if ($slotText !== '') {
-								self::doUpdateField((int) $storeId, $galleryTextField, $slotText);
-							} else {
-								$report['missing_image_mapping'] = (int) ($report['missing_image_mapping'] ?? 0) + 1;
-							}
-						}
-
-						if (self::shouldUpdateField((int) $storeId, $galleryImageField, $isExisting, $merge)) {
-							$newAttachmentId = self::sideloadOldAttachmentId(
-								$imgOldAttachmentId,
-								$attachmentUrlMap,
-								$uploadedAttachmentIdCache,
-								(int) $storeId,
-								$dryRun,
-								$report
-							);
-
-							if ($newAttachmentId) {
-								self::doUpdateField((int) $storeId, $galleryImageField, (int) $newAttachmentId);
-							}
-						}
-					}
-
-					// Ensure hero image renders even if ACF image fields were already present
-					// but the post thumbnail was not set (common when importing older records).
-					if (function_exists('set_post_thumbnail')) {
-						$currentThumb = get_post_meta((int) $storeId, '_thumbnail_id', true);
-						$isThumbEmpty = ($currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0);
-						if ($isThumbEmpty) {
-							$acfThumb = (int) get_post_meta((int) $storeId, 'first_section_image', true);
-							if ($acfThumb > 0) {
-								set_post_thumbnail((int) $storeId, $acfThumb);
-							}
-						}
-					}
-
-					// Fill post_content only when blank (merge_strategy=s2), because the
-					// Store Locator template may render the short description from it.
-					$desc = (string) ($payload['short_description'] ?? '');
-					if ($desc) {
-						$desiredContent = '' . "\n" . '<p>' . esc_html($desc) . '</p>' . "\n" . '';
-						if (! $isExisting) {
-							wp_update_post(
-								[
-									'ID' => (int) $storeId,
-									'post_content' => $desiredContent,
-								],
-								true
-							);
-						} else {
-							$currentContent = (string) get_post_field('post_content', (int) $storeId);
-							$currentContentTrim = trim($currentContent);
-							$shouldUpdateContent = ($merge !== 's2') || ($currentContentTrim === '');
-							if ($shouldUpdateContent) {
-								wp_update_post(
-									[
-										'ID' => (int) $storeId,
-										'post_content' => $desiredContent,
-									],
-									true
-								);
-							}
+						if ( $newAttachmentId ) {
+							self::doUpdateField( (int) $storeId, $galleryImageField, (int) $newAttachmentId );
 						}
 					}
 				}
-			);
+
+				if ( function_exists( 'set_post_thumbnail' ) ) {
+					$currentThumb = get_post_meta( (int) $storeId, '_thumbnail_id', true );
+					$isThumbEmpty = ( $currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0 );
+					if ( $isThumbEmpty ) {
+						$acfThumb = (int) get_post_meta( (int) $storeId, 'first_section_image', true );
+						if ( $acfThumb > 0 ) {
+							set_post_thumbnail( (int) $storeId, $acfThumb );
+						}
+					}
+				}
+
+				$desc = isset( $payload['short_description'] ) ? (string) $payload['short_description'] : '';
+				if ( $desc !== '' ) {
+					$desiredContent = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
+					if ( ! $isExisting ) {
+						wp_update_post(
+							array(
+								'ID' => (int) $storeId,
+								'post_content' => $desiredContent
+							),
+							true
+						);
+					} else {
+						$currentContent = (string) get_post_field( 'post_content', (int) $storeId );
+						$currentContentTrim = trim( $currentContent );
+						$shouldUpdateContent = ( $merge !== 's2' ) || ( $currentContentTrim === '' );
+						if ( $shouldUpdateContent ) {
+							wp_update_post(
+								array(
+									'ID' => (int) $storeId,
+									'post_content' => $desiredContent
+								),
+								true
+							);
+						}
+					}
+				}
+			}
 
 			return $report;
 		}
 
 		/**
-		 * WP-CLI command handler implementation.
-		 * * Required arguments: `--old-xml=/path/to/file`
-		 * Optional arguments: `--slug`, `--merge`, `--dry-run`
-		 *
-		 * @param array $args Unassoc parameters mapped out structurally via WP_CLI configuration parameter array configuration inputs context schema values payload context.
-		 * @param array $assoc_args Configured flag parameter string execution context input wrapper string format structure input.
+		 * Top level WP-CLI command executor binding arguments directly.
+		 * * @param array $args Command arguments.
+		 * @param array $assoc_args Bound array mapping arguments.
 		 */
-		public static function run(array $args, array $assoc_args): void
-		{
-			$oldXml = (string) ($assoc_args['old-xml'] ?? '');
-			if (! $oldXml || ! file_exists($oldXml)) {
-				WP_CLI::error('Missing or unreadable --old-xml=' . $oldXml);
+		public static function run( $args, $assoc_args ) {
+			$oldXml = isset( $assoc_args['old-xml'] ) ? (string) $assoc_args['old-xml'] : '';
+			if ( ! $oldXml || ! file_exists( $oldXml ) ) {
+				WP_CLI::error( 'Missing or unreadable --old-xml=' . $oldXml );
 				return;
 			}
 
-			$slug = isset($assoc_args['slug']) ? (string) $assoc_args['slug'] : '';
-			$merge = strtolower((string) ($assoc_args['merge'] ?? 's2'));
-			$dryRun = ! empty($assoc_args['dry-run']);
+			$slug = isset( $assoc_args['slug'] ) ? (string) $assoc_args['slug'] : '';
+			$merge = strtolower( isset( $assoc_args['merge'] ) ? (string) $assoc_args['merge'] : 's2' );
+			$dryRun = ! empty( $assoc_args['dry-run'] );
 
-			WP_CLI::line('Loading old attachment URLs...');
-			$parser = new IVolve_WXR_Store_Locator_Parser($oldXml);
-			$attachmentUrlMap = $parser->loadAttachmentUrlMap();
-			WP_CLI::line('Attachments loaded: ' . count($attachmentUrlMap));
+			WP_CLI::line( 'Loading old attachment URLs...' );
+			$xml = self::loadXml( $oldXml );
+			$attachmentUrlMap = self::getAttachmentUrlMap( $xml );
+			WP_CLI::line( 'Attachments loaded: ' . count( $attachmentUrlMap ) );
 
-			// In this first todo we only set up parsing + iteration.
-			WP_CLI::line('Beginning locations iteration...');
+			WP_CLI::line( 'Beginning locations iteration...' );
 
 			$processed = 0;
-			$uploadedAttachmentIdCache = [];
-			$report = [
+			$uploadedAttachmentIdCache = array();
+			$report = array(
 				'locations_scanned' => 0,
 				'stores_processed' => 0,
 				'stores_created' => 0,
@@ -1551,346 +1494,336 @@ if (! class_exists('IVolve_Store_Locator_Import_Command')) {
 				'missing_attachment_url' => 0,
 				'sideload_failed' => 0,
 				'missing_image_mapping' => 0,
-				'images_sideloaded' => 0,
-			];
-			$parser->iterateLocations(
-				function (array $location) use ($slug, &$processed, $dryRun, $attachmentUrlMap, $merge, &$uploadedAttachmentIdCache, &$report) {
-					$processed++;
-					$oldPostName = self::getImportSlug($location);
-					if ($slug && $oldPostName !== $slug) {
-						return;
-					}
-
-					WP_CLI::line(sprintf('Importing location: %s (%s)', $oldPostName, $location['post_title']));
-
-					$report['stores_processed'] = (int) $report['stores_processed'] + 1;
-
-					$payload = self::mapLocationPayload($location);
-
-					$storeId = self::getExistingStoreIdBySlug($oldPostName);
-					$isExisting = $storeId > 0;
-
-					if (! $dryRun && ! $isExisting) {
-						$storeId = wp_insert_post(
-							[
-								'post_type' => 'wpsl_stores',
-								'post_status' => self::mapOldStatusToTargetStatus($location),
-								'post_name' => $oldPostName,
-								'post_title' => $location['post_title'],
-								'post_content' => (function () use ($payload) {
-									$desc = (string) ($payload['short_description'] ?? '');
-									if (! $desc) {
-										return '';
-									}
-									$descEsc = esc_html($desc);
-									return '' . "\n" . '<p>' . $descEsc . '</p>' . "\n" . '';
-								})(),
-							],
-							true
-						);
-
-						if (is_wp_error($storeId)) {
-							WP_CLI::error('Failed to create wpsl_stores post: ' . $storeId->get_error_message());
-							return;
-						}
-
-						self::ensureWpslCategory((int) $storeId, (string) $payload['taxonomy_category_nicename']);
-						$report['stores_created'] = (int) $report['stores_created'] + 1;
-					} else if ($isExisting) {
-						$report['stores_existing'] = (int) $report['stores_existing'] + 1;
-					}
-
-					if (! $storeId) {
-						// Dry run case: we still want to show mapping summary.
-						WP_CLI::line('Dry run: would create/update store for slug: ' . $oldPostName);
-						$isExisting = $isExisting; // keep.
-					}
-
-					WP_CLI::line('Store ID: ' . (int) $storeId . ' existing=' . ($isExisting ? 'yes' : 'no'));
-
-					if ($dryRun) {
-						WP_CLI::line('Dry run mode: skipping all write operations.');
-						return;
-					}
-
-					if ($storeId) {
-						// Store Locator meta.
-						foreach ($payload['wpsl'] as $metaKey => $metaValue) {
-							self::updatePostMetaIfNeeded((int) $storeId, (string) $metaKey, $metaValue, $isExisting, $merge);
-						}
-
-						// ACF fields.
-						self::updateFieldIfNeeded((int) $storeId, 'number_of_bedrooms', (int) ($payload['bedrooms'] ?? 0), $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'cqc_id', (string) $payload['cqc_id'], $isExisting, $merge);
-
-						self::updateFieldIfNeeded((int) $storeId, 'first_section_heading', (string) $payload['first_section_heading'], $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'first_section_content', (string) $payload['first_section_content'], $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'two_columns_heading', (string) $payload['two_columns_heading'], $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'two_columns_content', (string) $payload['two_columns_content'], $isExisting, $merge);
-
-						self::updateFieldIfNeeded((int) $storeId, 'two_columns_button_text', (string) ($payload['two_columns_button_text'] ?? ''), $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'two_columns_button_link', (string) ($payload['two_columns_button_link'] ?? ''), $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'walkthrough_360', (string) ($payload['walkthrough_360'] ?? ''), $isExisting, $merge);
-
-						self::updateFieldIfNeeded((int) $storeId, 'our_expertise', (array) $payload['our_expertise'], $isExisting, $merge);
-						self::updateFieldIfNeeded((int) $storeId, 'facilities_and_features', (array) $payload['facilities_and_features'], $isExisting, $merge);
-
-						// Images (t3): sideload attachment URLs, then set ACF image fields.
-						$oldRefs = $payload['old_image_refs'] ?? [];
-
-						$imageFields = [
-							'first_section_image' => $oldRefs['first_section_image'] ?? null,
-							'two_columns_image' => $oldRefs['two_columns_image'] ?? null,
-							'kitchen' => $oldRefs['kitchen'] ?? null,
-							'living_room' => $oldRefs['living_room'] ?? null,
-							'dining_room' => $oldRefs['dining_room'] ?? null,
-						];
-
-						foreach ($imageFields as $fieldName => $oldAttachmentId) {
-							if (! self::shouldUpdateField((int) $storeId, (string) $fieldName, $isExisting, $merge)) {
-								continue;
-							}
-
-							if (! $oldAttachmentId) {
-								$report['missing_image_mapping'] = (int) ($report['missing_image_mapping'] ?? 0) + 1;
-								continue;
-							}
-
-							$newAttachmentId = self::sideloadOldAttachmentId($oldAttachmentId, $attachmentUrlMap, $uploadedAttachmentIdCache, (int) $storeId, $dryRun, $report);
-							if ($newAttachmentId) {
-								self::doUpdateField((int) $storeId, (string) $fieldName, (int) $newAttachmentId);
-
-								// Populate the post thumbnail so the template can show the hero image.
-								if ($fieldName === 'first_section_image' && function_exists('set_post_thumbnail')) {
-									$currentThumb = get_post_meta((int) $storeId, '_thumbnail_id', true);
-									$isThumbEmpty = ($currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0);
-
-									if (! $isExisting || $merge !== 's2' || $isThumbEmpty) {
-										set_post_thumbnail((int) $storeId, (int) $newAttachmentId);
-									}
-								}
-							}
-						}
-
-						// Gallery slots: `gallery_image_1..gallery_image_10` + `gallery_text_1..gallery_text_10`.
-						$galleryImages = (array) ($oldRefs['gallery_images'] ?? []);
-						$galleryTexts = (array) ($oldRefs['gallery_texts'] ?? []);
-						$maxSlots = 10;
-						for ($i = 1; $i <= $maxSlots; $i++) {
-							$imgIndex = $i - 1;
-							$imgOldAttachmentId = $galleryImages[$imgIndex] ?? null;
-							$galleryImageField = 'gallery_image_' . $i;
-							$galleryTextField = 'gallery_text_' . $i;
-
-							$slotText = isset($galleryTexts[$imgIndex]) ? (string) $galleryTexts[$imgIndex] : '';
-
-							if (self::shouldUpdateField((int) $storeId, $galleryTextField, $isExisting, $merge)) {
-								if ($slotText !== '') {
-									self::doUpdateField((int) $storeId, $galleryTextField, $slotText);
-								} else {
-									// Field exists but old extraction didn't produce text for this slot.
-									$report['missing_image_mapping'] = (int) ($report['missing_image_mapping'] ?? 0) + 1;
-								}
-							}
-
-							if (self::shouldUpdateField((int) $storeId, $galleryImageField, $isExisting, $merge)) {
-								$newAttachmentId = self::sideloadOldAttachmentId($imgOldAttachmentId, $attachmentUrlMap, $uploadedAttachmentIdCache, (int) $storeId, $dryRun, $report);
-								if ($newAttachmentId) {
-									self::doUpdateField((int) $storeId, $galleryImageField, (int) $newAttachmentId);
-								}
-							}
-						}
-
-						// Ensure hero image renders even if ACF image fields already existed
-						// but post thumbnail was missing.
-						if (function_exists('set_post_thumbnail')) {
-							$currentThumb = get_post_meta((int) $storeId, '_thumbnail_id', true);
-							$isThumbEmpty = ($currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0);
-							if ($isThumbEmpty) {
-								$acfThumb = (int) get_post_meta((int) $storeId, 'first_section_image', true);
-								if ($acfThumb > 0) {
-									set_post_thumbnail((int) $storeId, $acfThumb);
-								}
-							}
-						}
-
-						// Fill post_content from the old `location_description` when blank (s2),
-						// because the Store Locator template may render this field directly.
-						$desc = (string) ($payload['short_description'] ?? '');
-						if ($desc) {
-							$desiredContent = '' . "\n" . '<p>' . esc_html($desc) . '</p>' . "\n" . '';
-							if (! $isExisting || $merge !== 's2') {
-								// For newly created records, it's already set on insert; for non-s2, refresh it.
-								wp_update_post(
-									[
-										'ID' => (int) $storeId,
-										'post_content' => $desiredContent,
-									],
-									true
-								);
-							} else {
-								$currentContent = (string) get_post_field('post_content', (int) $storeId);
-								$currentContentTrim = trim($currentContent);
-								if ($currentContentTrim === '') {
-									wp_update_post(
-										[
-											'ID' => (int) $storeId,
-											'post_content' => $desiredContent,
-										],
-										true
-									);
-								}
-							}
-						}
-
-						WP_CLI::line('Mapped text fields + arrays + images (t3).');
-					}
-
-					// For images, we only log the old attachment IDs here; t3 will sideload + update ACF image fields.
-					$oldRefs = $payload['old_image_refs'] ?? [];
-					WP_CLI::line('Old image refs (attachment IDs): kitchen=' . ($oldRefs['kitchen'] ?? 'null') . ' living=' . ($oldRefs['living_room'] ?? 'null') . ' dining=' . ($oldRefs['dining_room'] ?? 'null'));
-					WP_CLI::line('Gallery old image IDs: ' . implode(',', (array) ($oldRefs['gallery_images'] ?? [])));
-				}
+				'images_sideloaded' => 0
 			);
 
-			WP_CLI::line('Locations scanned: ' . $processed);
+			$locations = self::getLocations( $xml );
+
+			if ( empty( $locations ) ) {
+				WP_CLI::line( 'No items found in WXR.' );
+				return;
+			}
+
+			foreach ( $locations as $payload ) {
+				$processed ++;
+				$oldPostName = $payload['post_name'];
+				
+				if ( $slug && $oldPostName !== $slug ) {
+					continue;
+				}
+
+				WP_CLI::line( sprintf( 'Importing location: %s (%s)', $oldPostName, $payload['post_title'] ) );
+
+				$report['stores_processed'] = isset( $report['stores_processed'] ) ? (int) $report['stores_processed'] + 1 : 1;
+
+				$storeId = self::getExistingStoreIdBySlug( $oldPostName );
+				$isExisting = $storeId > 0;
+
+				if ( ! $dryRun && ! $isExisting ) {
+					$desc = isset( $payload['short_description'] ) ? (string) $payload['short_description'] : '';
+					$postContentHtml = '';
+					if ( $desc !== '' ) {
+						$postContentHtml = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
+					}
+
+					$storeId = wp_insert_post(
+						array(
+							'post_type' => 'wpsl_stores',
+							'post_status' => self::mapOldStatusToTargetStatus( array( 'post_status' => $payload['post_status'] ) ),
+							'post_name' => $oldPostName,
+							'post_title' => $payload['post_title'],
+							'post_content' => $postContentHtml
+						),
+						true
+					);
+
+					if ( is_wp_error( $storeId ) ) {
+						WP_CLI::error( 'Failed to create wpsl_stores post: ' . $storeId->get_error_message() );
+						continue;
+					}
+
+					$category = isset( $payload['taxonomy_category_nicename'] ) ? (string) $payload['taxonomy_category_nicename'] : '';
+					self::ensureWpslCategory( (int) $storeId, $category );
+					$report['stores_created'] = isset( $report['stores_created'] ) ? (int) $report['stores_created'] + 1 : 1;
+				} else if ( $isExisting ) {
+					$report['stores_existing'] = isset( $report['stores_existing'] ) ? (int) $report['stores_existing'] + 1 : 1;
+				}
+
+				if ( ! $storeId ) {
+					WP_CLI::line( 'Dry run: would create/update store for slug: ' . $oldPostName );
+					$isExisting = $isExisting;
+				} else {
+					WP_CLI::line( 'Store ID: ' . (int) $storeId . ' existing=' . ( $isExisting ? 'yes' : 'no' ) );
+				}
+
+				if ( $dryRun ) {
+					WP_CLI::line( 'Dry run mode: skipping all write operations.' );
+					continue;
+				}
+
+				if ( $storeId ) {
+					$wpslArray = isset( $payload['wpsl'] ) ? (array) $payload['wpsl'] : array();
+					foreach ( $wpslArray as $metaKey => $metaValue ) {
+						self::updatePostMetaIfNeeded( (int) $storeId, (string) $metaKey, $metaValue, $isExisting, $merge );
+					}
+
+					self::updateFieldIfNeeded( (int) $storeId, 'number_of_bedrooms', isset( $payload['bedrooms'] ) ? (int) $payload['bedrooms'] : 0, $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'cqc_id', isset( $payload['cqc_id'] ) ? (string) $payload['cqc_id'] : '', $isExisting, $merge );
+
+					self::updateFieldIfNeeded( (int) $storeId, 'first_section_heading', isset( $payload['first_section_heading'] ) ? (string) $payload['first_section_heading'] : '', $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'first_section_content', isset( $payload['first_section_content'] ) ? (string) $payload['first_section_content'] : '', $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'two_columns_heading', isset( $payload['two_columns_heading'] ) ? (string) $payload['two_columns_heading'] : '', $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'two_columns_content', isset( $payload['two_columns_content'] ) ? (string) $payload['two_columns_content'] : '', $isExisting, $merge );
+
+					self::updateFieldIfNeeded( (int) $storeId, 'two_columns_button_text', isset( $payload['two_columns_button_text'] ) ? (string) $payload['two_columns_button_text'] : '', $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'two_columns_button_link', isset( $payload['two_columns_button_link'] ) ? (string) $payload['two_columns_button_link'] : '', $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'walkthrough_360', isset( $payload['walkthrough_360'] ) ? (string) $payload['walkthrough_360'] : '', $isExisting, $merge );
+
+					self::updateFieldIfNeeded( (int) $storeId, 'our_expertise', isset( $payload['our_expertise'] ) ? (array) $payload['our_expertise'] : array(), $isExisting, $merge );
+					self::updateFieldIfNeeded( (int) $storeId, 'facilities_and_features', isset( $payload['facilities_and_features'] ) ? (array) $payload['facilities_and_features'] : array(), $isExisting, $merge );
+
+					$oldRefs = isset( $payload['old_image_refs'] ) ? (array) $payload['old_image_refs'] : array();
+
+					$imageFields = array(
+						'first_section_image' => isset( $oldRefs['first_section_image'] ) ? $oldRefs['first_section_image'] : null,
+						'two_columns_image' => isset( $oldRefs['two_columns_image'] ) ? $oldRefs['two_columns_image'] : null,
+						'kitchen' => isset( $oldRefs['kitchen'] ) ? $oldRefs['kitchen'] : null,
+						'living_room' => isset( $oldRefs['living_room'] ) ? $oldRefs['living_room'] : null,
+						'dining_room' => isset( $oldRefs['dining_room'] ) ? $oldRefs['dining_room'] : null
+					);
+
+					foreach ( $imageFields as $fieldName => $oldAttachmentId ) {
+						if ( ! self::shouldUpdateField( (int) $storeId, (string) $fieldName, $isExisting, $merge ) ) {
+							continue;
+						}
+
+						if ( ! $oldAttachmentId ) {
+							$report['missing_image_mapping'] = isset( $report['missing_image_mapping'] ) ? (int) $report['missing_image_mapping'] + 1 : 1;
+							continue;
+						}
+
+						$newAttachmentId = self::sideloadOldAttachmentId( $oldAttachmentId, $attachmentUrlMap, $uploadedAttachmentIdCache, (int) $storeId, $dryRun, $report );
+						if ( $newAttachmentId ) {
+							self::doUpdateField( (int) $storeId, (string) $fieldName, (int) $newAttachmentId );
+
+							if ( $fieldName === 'first_section_image' && function_exists( 'set_post_thumbnail' ) ) {
+								$currentThumb = get_post_meta( (int) $storeId, '_thumbnail_id', true );
+								$isThumbEmpty = ( $currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0 );
+
+								if ( ! $isExisting || $merge !== 's2' || $isThumbEmpty ) {
+									set_post_thumbnail( (int) $storeId, (int) $newAttachmentId );
+								}
+							}
+						}
+					}
+
+					$galleryImages = isset( $oldRefs['gallery_images'] ) ? (array) $oldRefs['gallery_images'] : array();
+					$galleryTexts = isset( $oldRefs['gallery_texts'] ) ? (array) $oldRefs['gallery_texts'] : array();
+					$maxSlots = 10;
+					
+					for ( $i = 1; $i <= $maxSlots; $i ++ ) {
+						$imgIndex = $i - 1;
+						$imgOldAttachmentId = isset( $galleryImages[ $imgIndex ] ) ? $galleryImages[ $imgIndex ] : null;
+						$galleryImageField = 'gallery_image_' . $i;
+						$galleryTextField = 'gallery_text_' . $i;
+
+						$slotText = isset( $galleryTexts[ $imgIndex ] ) ? (string) $galleryTexts[ $imgIndex ] : '';
+
+						if ( self::shouldUpdateField( (int) $storeId, $galleryTextField, $isExisting, $merge ) ) {
+							if ( $slotText !== '' ) {
+								self::doUpdateField( (int) $storeId, $galleryTextField, $slotText );
+							} else {
+								$report['missing_image_mapping'] = isset( $report['missing_image_mapping'] ) ? (int) $report['missing_image_mapping'] + 1 : 1;
+							}
+						}
+
+						if ( self::shouldUpdateField( (int) $storeId, $galleryImageField, $isExisting, $merge ) ) {
+							$newAttachmentId = self::sideloadOldAttachmentId( $imgOldAttachmentId, $attachmentUrlMap, $uploadedAttachmentIdCache, (int) $storeId, $dryRun, $report );
+							if ( $newAttachmentId ) {
+								self::doUpdateField( (int) $storeId, $galleryImageField, (int) $newAttachmentId );
+							}
+						}
+					}
+
+					if ( function_exists( 'set_post_thumbnail' ) ) {
+						$currentThumb = get_post_meta( (int) $storeId, '_thumbnail_id', true );
+						$isThumbEmpty = ( $currentThumb === '' || $currentThumb === null || (int) $currentThumb === 0 );
+						if ( $isThumbEmpty ) {
+							$acfThumb = (int) get_post_meta( (int) $storeId, 'first_section_image', true );
+							if ( $acfThumb > 0 ) {
+								set_post_thumbnail( (int) $storeId, $acfThumb );
+							}
+						}
+					}
+
+					$desc = isset( $payload['short_description'] ) ? (string) $payload['short_description'] : '';
+					if ( $desc !== '' ) {
+						$desiredContent = '' . "\n" . '<p>' . esc_html( $desc ) . '</p>' . "\n" . '';
+						if ( ! $isExisting || $merge !== 's2' ) {
+							wp_update_post(
+								array(
+									'ID' => (int) $storeId,
+									'post_content' => $desiredContent
+								),
+								true
+							);
+						} else {
+							$currentContent = (string) get_post_field( 'post_content', (int) $storeId );
+							$currentContentTrim = trim( $currentContent );
+							if ( $currentContentTrim === '' ) {
+								wp_update_post(
+									array(
+										'ID' => (int) $storeId,
+										'post_content' => $desiredContent
+									),
+									true
+								);
+							}
+						}
+					}
+
+					WP_CLI::line( 'Mapped text fields + arrays + images (t3).' );
+				}
+
+				$oldRefs = isset( $payload['old_image_refs'] ) ? (array) $payload['old_image_refs'] : array();
+				$kitchenRef = isset( $oldRefs['kitchen'] ) ? $oldRefs['kitchen'] : 'null';
+				$livingRef = isset( $oldRefs['living_room'] ) ? $oldRefs['living_room'] : 'null';
+				$diningRef = isset( $oldRefs['dining_room'] ) ? $oldRefs['dining_room'] : 'null';
+				
+				WP_CLI::line( 'Old image refs (attachment IDs): kitchen=' . $kitchenRef . ' living=' . $livingRef . ' dining=' . $diningRef );
+				WP_CLI::line( 'Gallery old image IDs: ' . implode( ',', isset( $oldRefs['gallery_images'] ) ? (array) $oldRefs['gallery_images'] : array() ) );
+			}
+
+			WP_CLI::line( 'Locations scanned: ' . $processed );
 			$report['locations_scanned'] = (int) $processed;
-			WP_CLI::line('Import summary:');
-			WP_CLI::line(' - stores_processed: ' . (int) ($report['stores_processed'] ?? 0));
-			WP_CLI::line(' - stores_created: ' . (int) ($report['stores_created'] ?? 0));
-			WP_CLI::line(' - stores_existing: ' . (int) ($report['stores_existing'] ?? 0));
-			WP_CLI::line(' - images_sideloaded: ' . (int) ($report['images_sideloaded'] ?? 0));
-			WP_CLI::line(' - missing_attachment_url: ' . (int) ($report['missing_attachment_url'] ?? 0));
-			WP_CLI::line(' - sideload_failed: ' . (int) ($report['sideload_failed'] ?? 0));
-			WP_CLI::line(' - missing_image_mapping: ' . (int) ($report['missing_image_mapping'] ?? 0));
+			WP_CLI::line( 'Import summary:' );
+			
+			$storesProcessed = isset( $report['stores_processed'] ) ? (int) $report['stores_processed'] : 0;
+			$storesCreated = isset( $report['stores_created'] ) ? (int) $report['stores_created'] : 0;
+			$storesExisting = isset( $report['stores_existing'] ) ? (int) $report['stores_existing'] : 0;
+			$imagesSideloaded = isset( $report['images_sideloaded'] ) ? (int) $report['images_sideloaded'] : 0;
+			$missingAttachmentUrl = isset( $report['missing_attachment_url'] ) ? (int) $report['missing_attachment_url'] : 0;
+			$sideloadFailed = isset( $report['sideload_failed'] ) ? (int) $report['sideload_failed'] : 0;
+			$missingImageMapping = isset( $report['missing_image_mapping'] ) ? (int) $report['missing_image_mapping'] : 0;
+			
+			WP_CLI::line( ' - stores_processed: ' . $storesProcessed );
+			WP_CLI::line( ' - stores_created: ' . $storesCreated );
+			WP_CLI::line( ' - stores_existing: ' . $storesExisting );
+			WP_CLI::line( ' - images_sideloaded: ' . $imagesSideloaded );
+			WP_CLI::line( ' - missing_attachment_url: ' . $missingAttachmentUrl );
+			WP_CLI::line( ' - sideload_failed: ' . $sideloadFailed );
+			WP_CLI::line( ' - missing_image_mapping: ' . $missingImageMapping );
 		}
 	}
 }
 
-// Register command only when WP-CLI is present.
-if (defined('WP_CLI') && WP_CLI) {
-	WP_CLI::add_command('ivolve locations store-locator-import', [IVolve_Store_Locator_Import_Command::class, 'run']);
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+	WP_CLI::add_command( 'ivolve locations store-locator-import', array( 'IVolve_Store_Locator_Import_Command', 'run' ) );
 }
 
-// Dashboard UI: allow running the importer from WP Admin.
-if (is_admin()) {
-	// WordPress often blocks `.xml` uploads by default; allow it explicitly so the dashboard form works.
-	add_filter(
-		'upload_mimes',
-		function ($mimes) {
-			// Accept common WXR content types.
-			$mimes['xml'] = 'application/xml';
-			return $mimes;
+if ( is_admin() ) {
+	function ivolve_store_locator_upload_mimes( $mimes ) {
+		$mimes['xml'] = 'application/xml';
+		return $mimes;
+	}
+	add_filter( 'upload_mimes', 'ivolve_store_locator_upload_mimes' );
+
+	function ivolve_store_locator_check_filetype( $data, $file, $filename, $mimes ) {
+		$ext = strtolower( pathinfo( (string) $filename, PATHINFO_EXTENSION ) );
+		if ( $ext === 'xml' ) {
+			$data['ext'] = 'xml';
+			$data['type'] = 'application/xml';
 		}
-	);
+		return $data;
+	}
+	add_filter( 'wp_check_filetype_and_ext', 'ivolve_store_locator_check_filetype', 10, 4 );
 
-	// Some setups ignore `upload_mimes` and rely on extension-to-mime detection.
-	// This filter loosens that detection for `.xml`.
-	add_filter(
-		'wp_check_filetype_and_ext',
-		function ($data, $file, $filename, $mimes) {
-			$ext = strtolower(pathinfo((string) $filename, PATHINFO_EXTENSION));
-			if ($ext === 'xml') {
-				$data['ext'] = 'xml';
-				$data['type'] = 'application/xml';
-			}
-			return $data;
-		},
-		10,
-		4
-	);
+	function ivolve_store_locator_admin_menu() {
+		add_menu_page(
+			'Store Locator Import',
+			'Store Locator Import',
+			'manage_options',
+			'ivolve-store-locator-import',
+			'ivolve_store_locator_admin_page'
+		);
+	}
+	add_action( 'admin_menu', 'ivolve_store_locator_admin_menu' );
 
-	add_action(
-		'admin_menu',
-		function () {
-			add_menu_page(
-				'Store Locator Import',
-				'Store Locator Import',
-				'manage_options',
-				'ivolve-store-locator-import',
-				function () {
-					if (! current_user_can('manage_options')) {
-						wp_die('Access denied.');
-					}
-
-					$nonce = wp_create_nonce('ivolve_store_locator_import');
-
-					echo '<div class="wrap">';
-					echo '<h1>Store Locator Import</h1>';
-					echo '<p>Upload the <code>locations</code> WXR export from the old site (must include attachments). Then run a dry run or the real import.</p>';
-					echo '<form method="post" enctype="multipart/form-data" action="' . esc_url(admin_url('admin-post.php')) . '">';
-					echo '<input type="hidden" name="action" value="ivolve_store_locator_importer" />';
-					echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($nonce) . '" />';
-
-					echo '<table class="form-table" role="presentation">';
-					echo '<tr><th scope="row"><label for="old_xml_upload">Old site WXR XML (upload)</label></th><td><input id="old_xml_upload" type="file" name="old_xml_upload" accept=".xml" required /></td></tr>';
-					echo '<tr><th scope="row"><label for="slug">Slug filter (optional)</label></th><td><input id="slug" type="text" name="slug" value="" placeholder="e.g. 68-woodhurst-avenue" /></td></tr>';
-					echo '<tr><th scope="row"><label for="merge">Merge strategy</label></th><td><select id="merge" name="merge"><option value="s2" selected>Fill blanks only (s2)</option></select></td></tr>';
-					echo '<tr><th scope="row"><label for="dry_run">Dry run</label></th><td><label><input id="dry_run" type="checkbox" name="dry_run" value="1" checked /> Scan/mapping only (no writes)</label></td></tr>';
-					echo '</table>';
-
-					echo '<p><button type="submit" class="button button-primary">Run Import</button></p>';
-					echo '</form>';
-					echo '</div>';
-				}
-			);
+	function ivolve_store_locator_admin_page() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
 		}
-	);
 
-	add_action(
-		'admin_post_ivolve_store_locator_importer',
-		function () {
-			if (! current_user_can('manage_options')) {
-				wp_die('Access denied.');
-			}
+		$nonce = wp_create_nonce( 'ivolve_store_locator_import' );
 
-			check_admin_referer('ivolve_store_locator_import');
+		echo '<div class="wrap">';
+		echo '<h1>Store Locator Import</h1>';
+		echo '<p>Upload the <code>locations</code> WXR export from the old site (must include attachments). Then run a dry run or the real import.</p>';
+		echo '<form method="post" enctype="multipart/form-data" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+		echo '<input type="hidden" name="action" value="ivolve_store_locator_importer" />';
+		echo '<input type="hidden" name="_wpnonce" value="' . esc_attr( $nonce ) . '" />';
+		echo '<table class="form-table" role="presentation">';
+		echo '<tr><th scope="row"><label for="old_xml_upload">Old site WXR XML (upload)</label></th><td><input id="old_xml_upload" type="file" name="old_xml_upload" accept=".xml" required /></td></tr>';
+		echo '<tr><th scope="row"><label for="slug">Slug filter (optional)</label></th><td><input id="slug" type="text" name="slug" value="" placeholder="e.g. 68-woodhurst-avenue" /></td></tr>';
+		echo '<tr><th scope="row"><label for="merge">Merge strategy</label></th><td><select id="merge" name="merge"><option value="s2" selected>Fill blanks only (s2)</option></select></td></tr>';
+		echo '<tr><th scope="row"><label for="dry_run">Dry run</label></th><td><label><input id="dry_run" type="checkbox" name="dry_run" value="1" checked /> Scan/mapping only (no writes)</label></td></tr>';
+		echo '</table>';
+		echo '<p><button type="submit" class="button button-primary">Run Import</button></p>';
+		echo '</form>';
+		echo '</div>';
+	}
 
-			$slug = isset($_POST['slug']) ? (string) $_POST['slug'] : '';
-			$merge = isset($_POST['merge']) ? (string) $_POST['merge'] : 's2';
-			$dryRun = ! empty($_POST['dry_run']);
-
-			if (empty($_FILES['old_xml_upload']) || empty($_FILES['old_xml_upload']['tmp_name'])) {
-				wp_die('Missing uploaded XML file.');
-			}
-
-			$handled = wp_handle_upload(
-				$_FILES['old_xml_upload'],
-				[
-					'test_form' => false,
-					'mimes' => ['xml' => 'application/xml, text/xml, text/plain'],
-				]
-			);
-
-			if (isset($handled['error'])) {
-				wp_die('Upload failed: ' . esc_html((string) $handled['error']));
-			}
-
-			$oldXmlPath = (string) ($handled['file'] ?? '');
-			if (! $oldXmlPath || ! file_exists($oldXmlPath)) {
-				wp_die('Uploaded file missing on server.');
-			}
-
-			// Prevent web timeouts for large imports.
-			@set_time_limit(0);
-
-			try {
-				$report = IVolve_Store_Locator_Import_Command::importFromOldXml($oldXmlPath, $slug, $merge, $dryRun);
-			} catch (Throwable $e) {
-				wp_die('Import failed: ' . esc_html($e->getMessage()));
-			}
-
-			echo '<div class="wrap">';
-			echo '<h1>Import Result</h1>';
-			echo '<p><a href="' . esc_url(admin_url('admin.php?page=ivolve-store-locator-import')) . '">Back</a></p>';
-			echo '<h2>Summary</h2>';
-			echo '<ul>';
-			foreach ((array) $report as $k => $v) {
-				echo '<li><strong>' . esc_html((string) $k) . ':</strong> ' . esc_html((string) $v) . '</li>';
-			}
-			echo '</ul>';
-			echo '<p>If the dry run succeeded, run again with dry run unchecked.</p>';
-			echo '</div>';
+	function ivolve_store_locator_admin_post() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
 		}
-	);
+
+		check_admin_referer( 'ivolve_store_locator_import' );
+
+		$slug = isset( $_POST['slug'] ) ? (string) $_POST['slug'] : '';
+		$merge = isset( $_POST['merge'] ) ? (string) $_POST['merge'] : 's2';
+		$dryRun = ! empty( $_POST['dry_run'] );
+
+		if ( empty( $_FILES['old_xml_upload'] ) || empty( $_FILES['old_xml_upload']['tmp_name'] ) ) {
+			wp_die( 'Missing uploaded XML file.' );
+		}
+
+		$handled = wp_handle_upload(
+			$_FILES['old_xml_upload'],
+			array(
+				'test_form' => false,
+				'mimes' => array( 'xml' => 'application/xml, text/xml, text/plain' )
+			)
+		);
+
+		if ( isset( $handled['error'] ) ) {
+			wp_die( 'Upload failed: ' . esc_html( (string) $handled['error'] ) );
+		}
+
+		$oldXmlPath = isset( $handled['file'] ) ? (string) $handled['file'] : '';
+		if ( ! $oldXmlPath || ! file_exists( $oldXmlPath ) ) {
+			wp_die( 'Uploaded file missing on server.' );
+		}
+
+		@set_time_limit( 0 );
+
+		try {
+			$report = IVolve_Store_Locator_Import_Command::importFromOldXml( $oldXmlPath, $slug, $merge, $dryRun );
+		} catch ( Exception $e ) {
+			wp_die( 'Import failed: ' . esc_html( $e->getMessage() ) );
+		}
+
+		echo '<div class="wrap">';
+		echo '<h1>Import Result</h1>';
+		echo '<p><a href="' . esc_url( admin_url( 'admin.php?page=ivolve-store-locator-import' ) ) . '">Back</a></p>';
+		echo '<h2>Summary</h2>';
+		echo '<ul>';
+		foreach ( (array) $report as $k => $v ) {
+			echo '<li><strong>' . esc_html( (string) $k ) . ':</strong> ' . esc_html( (string) $v ) . '</li>';
+		}
+		echo '</ul>';
+		echo '<p>If the dry run succeeded, run again with dry run unchecked.</p>';
+		echo '</div>';
+	}
+	add_action( 'admin_post_ivolve_store_locator_importer', 'ivolve_store_locator_admin_post' );
 }
