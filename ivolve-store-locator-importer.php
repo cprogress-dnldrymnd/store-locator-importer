@@ -375,9 +375,6 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 
 			$extractParagraphs = function ( string $segment, bool $truncateAtFirstButton = true ): array {
 				if ( $truncateAtFirstButton ) {
-					$buttonPos = strpos( $segment, '\s*<p[^>]*>(.*?)<\/p>\s*/s', $beforeButton, $matches ) ) {
-						return [];
-					}
 
 					$parts = [];
 					foreach ( $matches[1] as $pHtml ) {
