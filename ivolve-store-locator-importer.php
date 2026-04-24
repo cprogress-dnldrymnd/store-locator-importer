@@ -6,12 +6,9 @@
  * Author: Digitally Disruptive - Donald Raymundo
  * Author URI: https://digitallydisruptive.co.uk/
  * Description: Imports old `locations` CPT content into new `wpsl_stores` Store Locator fields (ACF + images).
- * Version: 0.2.3
+ * Version: 0.2.4
  *
- * Place this file into `wp-content/mu-plugins/` or `wp-content/plugins/` on your staging environment,
- * then run via WP-CLI:
- *
- * wp ivolve locations store-locator-import --old-xml="/path/to/Original Data/ivolve.WordPress.xml" --slug="68-woodhurst-avenue"
+ * Place this file into `wp-content/mu-plugins/` or `wp-content/plugins/` on your staging environment.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -62,6 +59,27 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				if ( $url ) {
 					$out[ $oldId ] = $url;
 				}
+			}
+
+			return $out;
+		}
+
+		public static function getLocations( $xml ) {
+			$out = array();
+			
+			if ( empty( $xml->channel->item ) ) {
+				return $out;
+			}
+
+			foreach ( $xml->channel->item as $item ) {
+				$wp = $item->children( 'wp', true );
+				$postType = isset( $wp->post_type ) ? (string) $wp->post_type : '';
+				
+				if ( $postType !== 'locations' ) {
+					continue;
+				}
+
+				$out[] = self::mapLocationPayload( $item );
 			}
 
 			return $out;
@@ -161,7 +179,12 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 			}
 			
 			if ( empty( $orderedGallery['gallery_image_old_attachment_ids'] ) && is_array( $legacyImages ) && ! empty( $legacyImages ) ) {
-				$orderedGallery['gallery_image_old_attachment_ids'] = array_map( 'intval', array_values( $legacyImages ) );
+				$tempVals = array_values( $legacyImages );
+				$mappedVals = array();
+				foreach ( $tempVals as $v ) {
+					$mappedVals[] = (int) $v;
+				}
+				$orderedGallery['gallery_image_old_attachment_ids'] = $mappedVals;
 			}
 
 			if ( ! isset( $twoImageColumns['first']['content'] ) || trim( $twoImageColumns['first']['content'] ) === '' ) {
@@ -1060,20 +1083,15 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				$report['acf_facilities_and_features_choices'] = ! empty( $facChoiceList ) ? implode( ' | ', $facChoiceList ) : '(empty/unavailable)';
 			}
 
-			if ( empty( $xml->channel->item ) ) {
+			$locations = self::getLocations( $xml );
+			
+			if ( empty( $locations ) ) {
 				return $report;
 			}
 
-			foreach ( $xml->channel->item as $item ) {
-				$wp = $item->children( 'wp', true );
-				$postType = isset( $wp->post_type ) ? (string) $wp->post_type : '';
-				if ( $postType !== 'locations' ) {
-					continue;
-				}
-
+			foreach ( $locations as $payload ) {
 				$report['locations_scanned'] = isset( $report['locations_scanned'] ) ? (int) $report['locations_scanned'] + 1 : 1;
 
-				$payload = self::mapLocationPayload( $item );
 				$oldPostName = $payload['post_name'];
 				
 				if ( $slug && $oldPostName !== $slug ) {
@@ -1300,20 +1318,15 @@ if ( ! class_exists( 'IVolve_Store_Locator_Import_Command' ) ) {
 				'images_sideloaded' => 0
 			);
 
-			if ( empty( $xml->channel->item ) ) {
+			$locations = self::getLocations( $xml );
+
+			if ( empty( $locations ) ) {
 				WP_CLI::line( 'No items found in WXR.' );
 				return;
 			}
 
-			foreach ( $xml->channel->item as $item ) {
-				$wp = $item->children( 'wp', true );
-				$postType = isset( $wp->post_type ) ? (string) $wp->post_type : '';
-				if ( $postType !== 'locations' ) {
-					continue;
-				}
-
+			foreach ( $locations as $payload ) {
 				$processed ++;
-				$payload = self::mapLocationPayload( $item );
 				$oldPostName = $payload['post_name'];
 				
 				if ( $slug && $oldPostName !== $slug ) {
